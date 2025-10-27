@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebSearch"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
