@@ -61,47 +61,50 @@ def initialize_portfolio() -> Dict:
 
 def load_portfolio() -> Dict:
     """
-    Load portfolio from JSON file or create new one
-    
+    Load portfolio from database
+
     Returns:
         Portfolio state dictionary
     """
-    portfolio_path = os.path.join("data", "trades", "portfolio.json")
-    
+    from src.db.operations import get_portfolio_state, get_portfolio_positions
+
     try:
-        if os.path.exists(portfolio_path):
-            with open(portfolio_path, "r", encoding="utf-8") as f:
-                portfolio = json.load(f)
-            logger.debug(f"Loaded existing portfolio with balance: ${portfolio.get('balance', 0):.2f}")
-            return portfolio
-        else:
-            logger.info("No existing portfolio found, creating new one")
-            portfolio = initialize_portfolio()
-            save_portfolio(portfolio)
-            return portfolio
-    except Exception as e:
-        logger.error(f"Error loading portfolio: {e}")
-        logger.info("Creating new portfolio due to load error")
-        portfolio = initialize_portfolio()
-        save_portfolio(portfolio)
+        # Get portfolio state from DB
+        portfolio_state = get_portfolio_state()
+
+        # Get open positions from DB
+        positions = get_portfolio_positions(status='open')
+
+        # Build portfolio dict matching existing format
+        portfolio = {
+            "balance": portfolio_state['balance'],
+            "positions": positions,
+            "total_invested": portfolio_state['total_invested'],
+            "total_profit_loss": portfolio_state['total_profit_loss'],
+            "trade_count": portfolio_state['trade_count'],
+            "created_at": portfolio_state['created_at'].isoformat() if isinstance(portfolio_state['created_at'], datetime) else portfolio_state['created_at'],
+            "last_updated": portfolio_state['last_updated'].isoformat() if isinstance(portfolio_state['last_updated'], datetime) else portfolio_state['last_updated']
+        }
+        logger.debug(f"Loaded portfolio from database with balance: ${portfolio.get('balance', 0):.2f}")
         return portfolio
+    except Exception as e:
+        logger.error(f"Error loading portfolio from database: {e}")
+        raise
 
 def save_portfolio(portfolio: Dict):
     """
-    Save portfolio to JSON file
-    
+    Save portfolio to database
+
     Args:
         portfolio: Portfolio state dictionary
     """
-    portfolio_path = os.path.join("data", "trades", "portfolio.json")
-    portfolio["last_updated"] = datetime.now().isoformat()
-    
+    from src.db.operations import upsert_portfolio_state
+
     try:
-        with open(portfolio_path, "w", encoding="utf-8") as f:
-            json.dump(portfolio, f, indent=2, ensure_ascii=False)
-        logger.debug(f"Saved portfolio with balance: ${portfolio.get('balance', 0):.2f}")
+        upsert_portfolio_state(portfolio)
+        logger.debug(f"Saved portfolio to database with balance: ${portfolio.get('balance', 0):.2f}")
     except Exception as e:
-        logger.error(f"Error saving portfolio: {e}")
+        logger.error(f"Error saving portfolio to database: {e}")
         raise
 
 def execute_trade(signal: Dict, portfolio: Dict) -> Dict:
@@ -171,32 +174,35 @@ def execute_trade(signal: Dict, portfolio: Dict) -> Dict:
 
 def append_trade_to_history(trade: Dict):
     """
-    Append executed trade to permanent trade history
-    
+    Append executed trade to permanent trade history in database
+
     Args:
         trade: Trade dictionary to append
     """
-    trades_path = os.path.join("data", "trades", "paper_trades.json")
-    
+    from src.db.operations import insert_trade, add_portfolio_position
+
     try:
-        # Load existing trades or start with empty list
-        if os.path.exists(trades_path):
-            with open(trades_path, "r", encoding="utf-8") as f:
-                trades_history = json.load(f)
-        else:
-            trades_history = []
-        
-        # Append new trade
-        trades_history.append(trade)
-        
-        # Save back to file (APPEND ONLY - never overwrite)
-        with open(trades_path, "w", encoding="utf-8") as f:
-            json.dump(trades_history, f, indent=2, ensure_ascii=False)
-        
-        logger.debug(f"Appended trade {trade['trade_id']} to history")
-        
+        # Insert trade into trades table
+        insert_trade(trade)
+
+        # Add position to portfolio_positions table
+        position = {
+            "trade_id": trade["trade_id"],
+            "market_id": trade['market_id'],
+            "market_question": trade['market_question'],
+            "action": trade['action'],
+            "amount": trade['amount'],
+            "entry_price": trade['entry_price'],
+            "entry_timestamp": trade["timestamp"],
+            "status": "open",
+            "current_pnl": 0.0
+        }
+        add_portfolio_position(position)
+
+        logger.debug(f"Inserted trade {trade['trade_id']} into database")
+
     except Exception as e:
-        logger.error(f"Error appending trade to history: {e}")
+        logger.error(f"Error appending trade to database: {e}")
         raise
 
 def update_portfolio_pnl(portfolio: Dict, current_market_data: Optional[List[Dict]] = None):
@@ -436,34 +442,25 @@ async def get_portfolio():
 @app.get("/paper-trading/trades-history")
 async def get_trades_history():
     """
-    Get complete trading history
-    
+    Get complete trading history from database
+
     Returns:
         All executed trades history
     """
+    from src.db.operations import get_trades
+
     try:
-        trades_path = os.path.join("data", "trades", "paper_trades.json")
-        
-        if not os.path.exists(trades_path):
-            return {
-                "message": "No trading history found",
-                "trades_count": 0,
-                "trades": [],
-                "timestamp": datetime.now().isoformat()
-            }
-        
-        with open(trades_path, "r", encoding="utf-8") as f:
-            trades_history = json.load(f)
-        
+        trades_history = get_trades()
+
         return {
-            "message": "Trading history retrieved",
+            "message": "Trading history retrieved from database",
             "trades_count": len(trades_history),
             "trades": trades_history,
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except Exception as e:
-        logger.error(f"Error getting trades history: {e}")
+        logger.error(f"Error getting trades history from database: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting trades history: {str(e)}")
 
 @app.get("/paper-trading/update-prices")
@@ -501,11 +498,13 @@ async def update_prices():
 @app.get("/paper-trading/status")
 async def get_paper_trading_status():
     """
-    Get status of paper trading system
+    Get status of paper trading system from database
 
     Returns:
         Status information about portfolio and trades
     """
+    from src.db.operations import get_trades
+
     try:
         status = {
             "timestamp": datetime.now().isoformat(),
@@ -524,30 +523,25 @@ async def get_paper_trading_status():
             status["price_updater_running"] = updater.running
             status["price_update_interval"] = updater.update_interval
 
-        # Check portfolio
-        portfolio_path = os.path.join("data", "trades", "portfolio.json")
-        if os.path.exists(portfolio_path):
+        # Check portfolio from database
+        try:
+            portfolio = load_portfolio()
             status["portfolio_exists"] = True
-            try:
-                portfolio = load_portfolio()
-                status["portfolio_balance"] = portfolio.get('balance', 0.0)
-                status["open_positions"] = len([p for p in portfolio.get('positions', []) if p.get('status') == 'open'])
-                status["total_trades"] = portfolio.get('trade_count', 0)
-                status["portfolio_last_updated"] = portfolio.get('last_updated')
-                status["last_price_update"] = portfolio.get('last_price_update')
-            except:
-                pass
+            status["portfolio_balance"] = portfolio.get('balance', 0.0)
+            status["open_positions"] = len([p for p in portfolio.get('positions', []) if p.get('status') == 'open'])
+            status["total_trades"] = portfolio.get('trade_count', 0)
+            status["portfolio_last_updated"] = portfolio.get('last_updated')
+            status["last_price_update"] = portfolio.get('last_price_update')
+        except:
+            pass
 
-        # Check trades history
-        trades_path = os.path.join("data", "trades", "paper_trades.json")
-        if os.path.exists(trades_path):
+        # Check trades history from database
+        try:
+            trades_history = get_trades()
             status["trades_history_exists"] = True
-            try:
-                with open(trades_path, "r", encoding="utf-8") as f:
-                    trades_history = json.load(f)
-                    status["trades_in_history"] = len(trades_history)
-            except:
-                pass
+            status["trades_in_history"] = len(trades_history)
+        except:
+            pass
 
         return status
 
