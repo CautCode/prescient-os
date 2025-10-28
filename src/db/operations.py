@@ -1,17 +1,29 @@
 """
-Database operations layer for Prescient OS - Phase 1: Portfolio & Trades
-Only includes operations needed for paper_trading_controller.py
+Database operations layer for Prescient OS
+Phase 1: Portfolio & Trades
+Phase 4: Events & Markets
 """
 
 import os
+import json
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, date
 from sqlalchemy import text
 import logging
 
 from src.db.connection import get_db
 
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+def _json_default_serializer(obj):
+    """JSON serializer for objects not serializable by default json code."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    raise TypeError(f"Type {type(obj)} not serializable")
 
 # ============================================================================
 # PORTFOLIO OPERATIONS
@@ -271,4 +283,234 @@ def update_trade_status(trade_id: str, status: str, pnl: float = None):
                 SET status = :status
                 WHERE trade_id = :trade_id
             """), {'trade_id': trade_id, 'status': status})
+        db.commit()
+
+
+# ============================================================================
+# EVENT OPERATIONS (Phase 4)
+# ============================================================================
+
+def upsert_events(events: List[Dict]):
+    """Insert or update events in database"""
+    with get_db() as db:
+        for event in events:
+            # Create a copy to avoid modifying original
+            event_copy = event.copy()
+
+            # Convert datetime objects to ISO format strings for JSON serialization
+            for key, value in event_copy.items():
+                if isinstance(value, (datetime, date)):
+                    event_copy[key] = value.isoformat()
+
+            event_data_json = json.dumps(event_copy, default=_json_default_serializer)
+
+            db.execute(text("""
+                INSERT INTO events
+                (event_id, title, slug, liquidity, volume, volume24hr,
+                 start_date, end_date, days_until_end, event_data, is_filtered, updated_at)
+                VALUES (:event_id, :title, :slug, :liquidity, :volume, :volume24hr,
+                        :start_date, :end_date, :days_until_end, CAST(:event_data AS jsonb), :is_filtered, NOW())
+                ON CONFLICT (event_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    slug = EXCLUDED.slug,
+                    liquidity = EXCLUDED.liquidity,
+                    volume = EXCLUDED.volume,
+                    volume24hr = EXCLUDED.volume24hr,
+                    start_date = EXCLUDED.start_date,
+                    end_date = EXCLUDED.end_date,
+                    days_until_end = EXCLUDED.days_until_end,
+                    event_data = EXCLUDED.event_data,
+                    is_filtered = EXCLUDED.is_filtered,
+                    updated_at = NOW()
+            """), {
+                'event_id': event.get('id'),
+                'title': event.get('title'),
+                'slug': event.get('slug'),
+                'liquidity': event.get('liquidity', 0),
+                'volume': event.get('volume', 0),
+                'volume24hr': event.get('volume24hr', 0),
+                'start_date': event.get('startDate'),
+                'end_date': event.get('endDate'),
+                'days_until_end': event.get('days_until_end'),
+                'event_data': event_data_json,
+                'is_filtered': event.get('is_filtered', False)
+            })
+        db.commit()
+
+
+def get_events(filters: Dict = None) -> List[Dict]:
+    """Get events with optional filters"""
+    with get_db() as db:
+        query = """
+            SELECT event_id, title, slug, liquidity, volume, volume24hr,
+                   start_date, end_date, days_until_end, event_data, is_filtered
+            FROM events
+        """
+
+        params = {}
+        where_clauses = []
+
+        if filters:
+            if 'is_filtered' in filters:
+                where_clauses.append("is_filtered = :is_filtered")
+                params['is_filtered'] = filters['is_filtered']
+
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+
+        query += " ORDER BY volume DESC"
+
+        results = db.execute(text(query), params).fetchall()
+
+        events = []
+        for row in results:
+            # PostgreSQL returns jsonb as dict already, no need to parse
+            event_data = row[9] if row[9] else {}
+            if isinstance(event_data, str):
+                event_data = json.loads(event_data)
+
+            event_data.update({
+                'id': row[0],
+                'title': row[1],
+                'slug': row[2],
+                'liquidity': float(row[3]) if row[3] else 0.0,
+                'volume': float(row[4]) if row[4] else 0.0,
+                'volume24hr': float(row[5]) if row[5] else 0.0,
+                'startDate': row[6],
+                'endDate': row[7],
+                'days_until_end': row[8],
+                'is_filtered': row[10]
+            })
+            events.append(event_data)
+
+        return events
+
+
+def clear_filtered_events():
+    """Clear all filtered events (useful before re-filtering)"""
+    with get_db() as db:
+        db.execute(text("UPDATE events SET is_filtered = FALSE WHERE is_filtered = TRUE"))
+        db.commit()
+
+
+# ============================================================================
+# MARKET OPERATIONS (Phase 4)
+# ============================================================================
+
+def upsert_markets(markets: List[Dict]):
+    """Insert or update markets in database"""
+    with get_db() as db:
+        for market in markets:
+            market_data_json = json.dumps(market, default=_json_default_serializer)
+            db.execute(text("""
+                INSERT INTO markets
+                (market_id, question, event_id, event_title, event_end_date,
+                 liquidity, volume, volume24hr, yes_price, no_price, market_conviction,
+                 market_data, is_filtered, updated_at)
+                VALUES (:market_id, :question, :event_id, :event_title, :event_end_date,
+                        :liquidity, :volume, :volume24hr, :yes_price, :no_price,
+                        :market_conviction, CAST(:market_data AS jsonb), :is_filtered, NOW())
+                ON CONFLICT (market_id) DO UPDATE SET
+                    question = EXCLUDED.question,
+                    liquidity = EXCLUDED.liquidity,
+                    volume = EXCLUDED.volume,
+                    volume24hr = EXCLUDED.volume24hr,
+                    yes_price = EXCLUDED.yes_price,
+                    no_price = EXCLUDED.no_price,
+                    market_conviction = EXCLUDED.market_conviction,
+                    market_data = EXCLUDED.market_data,
+                    is_filtered = EXCLUDED.is_filtered,
+                    updated_at = NOW()
+            """), {
+                'market_id': market.get('id'),
+                'question': market.get('question'),
+                'event_id': market.get('event_id'),
+                'event_title': market.get('event_title'),
+                'event_end_date': market.get('event_end_date'),
+                'liquidity': market.get('liquidity', 0),
+                'volume': market.get('volume', 0),
+                'volume24hr': market.get('volume24hr', 0),
+                'yes_price': market.get('yes_price'),
+                'no_price': market.get('no_price'),
+                'market_conviction': market.get('market_conviction'),
+                'market_data': market_data_json,
+                'is_filtered': market.get('is_filtered', True)
+            })
+        db.commit()
+
+
+def get_markets(filters: Dict = None) -> List[Dict]:
+    """Get markets with optional filters"""
+    with get_db() as db:
+        query = """
+            SELECT market_id, question, event_id, event_title, event_end_date,
+                   liquidity, volume, volume24hr, yes_price, no_price,
+                   market_conviction, market_data, is_filtered
+            FROM markets
+        """
+
+        params = {}
+        where_clauses = []
+
+        if filters:
+            if 'is_filtered' in filters:
+                where_clauses.append("is_filtered = :is_filtered")
+                params['is_filtered'] = filters['is_filtered']
+
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+
+        query += " ORDER BY volume DESC"
+
+        results = db.execute(text(query), params).fetchall()
+
+        markets = []
+        for row in results:
+            # PostgreSQL returns jsonb as dict already, no need to parse
+            market_data = row[11] if row[11] else {}
+            if isinstance(market_data, str):
+                market_data = json.loads(market_data)
+
+            market_data.update({
+                'id': row[0],
+                'question': row[1],
+                'event_id': row[2],
+                'event_title': row[3],
+                'event_end_date': row[4],
+                'liquidity': float(row[5]) if row[5] else 0.0,
+                'volume': float(row[6]) if row[6] else 0.0,
+                'volume24hr': float(row[7]) if row[7] else 0.0,
+                'yes_price': float(row[8]) if row[8] else None,
+                'no_price': float(row[9]) if row[9] else None,
+                'market_conviction': float(row[10]) if row[10] else None,
+                'is_filtered': row[12]
+            })
+            markets.append(market_data)
+
+        return markets
+
+
+def insert_market_snapshot(market_id: str, prices: Dict):
+    """Insert a market price snapshot for time-series tracking"""
+    with get_db() as db:
+        db.execute(text("""
+            INSERT INTO market_snapshots
+            (market_id, yes_price, no_price, liquidity, volume, volume24hr, market_conviction)
+            VALUES (:market_id, :yes_price, :no_price, :liquidity, :volume, :volume24hr, :market_conviction)
+        """), {
+            'market_id': market_id,
+            'yes_price': prices.get('yes_price'),
+            'no_price': prices.get('no_price'),
+            'liquidity': prices.get('liquidity'),
+            'volume': prices.get('volume'),
+            'volume24hr': prices.get('volume24hr'),
+            'market_conviction': prices.get('market_conviction')
+        })
+        db.commit()
+
+
+def clear_filtered_markets():
+    """Clear all filtered markets (useful before re-filtering)"""
+    with get_db() as db:
+        db.execute(text("UPDATE markets SET is_filtered = FALSE WHERE is_filtered = TRUE"))
         db.commit()

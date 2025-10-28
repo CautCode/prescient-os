@@ -126,32 +126,28 @@ async def root():
 @app.get("/strategy/generate-signals")
 async def generate_signals():
     """
-    Analyze markets and generate trading signals based on >50% strategy
-    
+    Analyze markets and generate trading signals (Phase 4: Reads markets from database)
+
     Returns:
         JSON response with generated signals and summary
     """
+    from src.db.operations import get_markets
+
     try:
         logger.info("=== STARTING TRADING SIGNAL GENERATION ===")
-        
-        # Ensure directories exist
+
+        # Ensure directories exist (still needed for saving signals to JSON)
         ensure_data_directories()
-        
-        # Step 1: Read filtered markets data
-        markets_path = os.path.join("data", "markets", "filtered_markets.json")
-        logger.info(f"Reading filtered markets from: {markets_path}")
-        
-        try:
-            with open(markets_path, "r", encoding="utf-8") as f:
-                markets_data = json.load(f)
-            logger.info(f"✓ Successfully loaded {len(markets_data)} markets")
-        except Exception as read_error:
-            logger.error(f"✗ Error reading markets file: {read_error}")
-            raise HTTPException(status_code=500, detail=f"Error reading markets file: {str(read_error)}")
-        
+
+        # Step 1: Read filtered markets from DATABASE (not JSON)
+        logger.info("Step 1: Loading filtered markets from database...")
+        markets_data = get_markets({'is_filtered': True})
+
         if not markets_data:
-            logger.warning("No markets data found")
-            raise HTTPException(status_code=404, detail="No markets data found. Please filter markets first.")
+            raise HTTPException(status_code=404,
+                detail="No markets data found in database. Please filter markets first.")
+
+        logger.info(f"Successfully loaded {len(markets_data)} markets from database")
         
         # Step 2: Generate trading signals
         logger.info("Step 2: Generating trading signals...")

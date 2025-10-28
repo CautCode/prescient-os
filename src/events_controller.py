@@ -1,6 +1,13 @@
-# Events Controller - Fetches Polymarket events, filters for trading viability (liquidity, volume, time horizon), exports to JSON
-# Main functions: get_active_events(), filter_trading_candidates_json(), export_all_active_events_json()
+# Events Controller - Fetches Polymarket events, filters for trading viability (liquidity, volume, time horizon), exports to DB
+# Main functions: get_active_events(), filter_trading_candidates_db(), export_all_active_events_db()
 # Used by: trading_controller.py for event data pipeline
+
+# Comments:
+# Do we need the is_filtered field in the database?
+# I think that this table has to be reset every time we filter the events.
+# Because this is just for getting new markets.
+# Surely if we already have some positions open we dont want to trade the same markets again.
+# So this should only be for getting new markets where we want to identify some opportunities.
 
 from fastapi import FastAPI, HTTPException, Query
 from typing import Dict, List, Optional
@@ -326,17 +333,18 @@ async def get_active_events():
         logger.error(f"Unexpected error in get_active_events: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/events/export-all-active-events-json")
-async def export_all_active_events_json():
+@app.get("/events/export-all-active-events-db")
+async def export_all_active_events_db():
     """
-    Export all active events as a json called raw_events_backup.json 
-    in the ../data/events directory.
+    Export all active events to database (Phase 4: Database version)
 
     Returns:
-        JSON response with file path and summary info
+        JSON response with summary info
     """
+    from src.db.operations import upsert_events
+
     try:
-        logger.info("Starting JSON export of all active events...")
+        logger.info("Starting database export of all active events...")
 
         # Reuse the existing get_active_events logic
         active_events_response = await get_active_events()
@@ -344,22 +352,30 @@ async def export_all_active_events_json():
         # Extract events from response
         all_events = active_events_response if isinstance(active_events_response, list) else active_events_response.get('data', active_events_response)
 
-        logger.info(f"Retrieved {len(all_events)} events for JSON export")
+        logger.info(f"Retrieved {len(all_events)} events for database export")
 
-        # Prepare directory and file path
-        events_dir = os.path.join("data", "events")
-        os.makedirs(events_dir, exist_ok=True)
-        file_path = os.path.join(events_dir, "raw_events_backup.json")
+        # Mark all as NOT filtered initially and compute days_until_end
+        current_time = datetime.now()
+        for event in all_events:
+            event['is_filtered'] = False
+            end_date_str = event.get('endDate')
+            if end_date_str:
+                try:
+                    end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                    days_diff = (end_date.replace(tzinfo=None) - current_time).days
+                    event['days_until_end'] = days_diff
+                except Exception:
+                    event['days_until_end'] = None
+            else:
+                event['days_until_end'] = None
 
-        # Save the full list of event jsons to disk
-        with open(file_path, "w", encoding="utf-8") as outfile:
-            json.dump(all_events, outfile, indent=2, ensure_ascii=False)
+        # Save to database
+        upsert_events(all_events)
 
-        logger.info(f"Successfully exported {len(all_events)} events to {file_path}")
+        logger.info(f"Successfully exported {len(all_events)} events to database")
 
         return {
-            "message": "All active events exported to JSON successfully",
-            "file_path": file_path,
+            "message": "All active events saved to database successfully",
             "total_events": len(all_events),
             "timestamp": datetime.now().isoformat()
         }
@@ -434,16 +450,16 @@ async def get_event_by_id(event_id: int):
         logger.error(f"Unexpected error in get_event_by_id: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/events/filter-trading-candidates-json")
-async def filter_trading_candidates_json(
-    min_liquidity: float = 10000,
-    min_volume: float = 50000,
-    min_volume_24hr: Optional[float] = None,
-    max_days_until_end: int = 90,
-    min_days_until_end: int = 1
+@app.get("/events/filter-trading-candidates-db")
+async def filter_trading_candidates_db(
+    min_liquidity: Optional[float] = Query(None),
+    min_volume: Optional[float] = Query(None),
+    min_volume_24hr: Optional[float] = Query(None),
+    max_days_until_end: Optional[int] = Query(None),
+    min_days_until_end: Optional[int] = Query(None)
 ):
     """
-    Filter events from the latest JSON export to create trading candidates
+    Filter events from database to create trading candidates (Phase 4: Database version)
 
     Args:
         min_liquidity: Minimum liquidity threshold
@@ -453,79 +469,63 @@ async def filter_trading_candidates_json(
         min_days_until_end: Minimum days until event ends
 
     Returns:
-        JSON response with filtered trading candidates JSON file path and summary
+        JSON response with filtered trading candidates summary
     """
+    from src.db.operations import get_events, upsert_events, clear_filtered_events
+
     try:
-        logger.info("=== STARTING TRADING CANDIDATES FILTERING (JSON version) ===")
-        logger.info(f"Parameters received: min_liquidity={min_liquidity}, min_volume={min_volume}, min_volume_24hr={min_volume_24hr}, max_days_until_end={max_days_until_end}, min_days_until_end={min_days_until_end}")
+        logger.info("=== STARTING TRADING CANDIDATES FILTERING (DATABASE version) ===")
+        logger.info(f"Parameters: min_liquidity={min_liquidity}, min_volume={min_volume}, max_days={max_days_until_end}")
 
-        # Step 1: Read raw events from JSON file
-        events_path = os.path.join("data", "events", "raw_events_backup.json")
-        logger.info(f"Reading raw events from: {events_path}")
-        try:
-            with open(events_path, "r", encoding="utf-8") as f:
-                events_data = json.load(f)
-            logger.info(f"✓ Successfully loaded {len(events_data)} events from JSON")
-        except Exception as read_error:
-            logger.error(f"✗ Error reading JSON file: {read_error}")
-            raise HTTPException(status_code=500, detail=f"Error reading JSON file: {str(read_error)}")
+        # Step 1: Read all events from database
+        logger.info("Step 1: Loading events from database...")
+        events_data = get_events()
 
-        # Step 2: Apply JSON filters directly (no DataFrame conversion needed)
-        logger.info("Step 2: Applying JSON trading filters...")
-        try:
-            filtered_events = apply_json_trading_filters(
-                events_list=events_data,
-                min_liquidity=min_liquidity,
-                min_volume=min_volume,
-                min_volume_24hr=min_volume_24hr,
-                max_days_until_end=max_days_until_end,
-                min_days_until_end=min_days_until_end
-            )
-            logger.info(f"✓ Successfully applied filters. Filtered events count: {len(filtered_events)}")
-        except Exception as filter_error:
-            logger.error(f"✗ Error applying filters: {filter_error}")
-            import traceback
-            logger.error(f"Filter error traceback: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=f"Error applying filters: {str(filter_error)}")
+        if not events_data:
+            raise HTTPException(status_code=500, detail="No events found in database. Please export events first.")
 
-        # Step 3: Export filtered trading candidates to JSON
-        logger.info("Step 3: Exporting filtered trading candidates to JSON...")
-        try:
-            # Save to fixed filename for trading system consumption (OVERWRITE as per data persistence strategy)
-            output_filename = "filtered_events.json"
-            output_dir = os.path.join("data", "events")
-            output_path = os.path.join(output_dir, output_filename)
-            with open(output_path, "w", encoding="utf-8") as fout:
-                json.dump(filtered_events, fout, ensure_ascii=False, indent=2)
-            logger.info(f"✓ Successfully exported JSON to: {output_path}")
-        except Exception as export_error:
-            logger.error(f"✗ Error exporting JSON: {export_error}")
-            raise HTTPException(status_code=500, detail=f"Error exporting JSON: {str(export_error)}")
+        logger.info(f"Successfully loaded {len(events_data)} events from database")
+
+        # Step 2: Apply filters (same logic as before)
+        logger.info("Step 2: Applying trading filters...")
+        filtered_events = apply_json_trading_filters(
+            events_list=events_data,
+            min_liquidity=min_liquidity,
+            min_volume=min_volume,
+            min_volume_24hr=min_volume_24hr,
+            max_days_until_end=max_days_until_end,
+            min_days_until_end=min_days_until_end
+        )
+        logger.info(f"Successfully applied filters. Filtered events count: {len(filtered_events)}")
+
+        # Step 3: Mark filtered events in database
+        logger.info("Step 3: Marking filtered events in database...")
+
+        # Clear previous filtered flags
+        clear_filtered_events()
+
+        # Mark new filtered events
+        for event in filtered_events:
+            event['is_filtered'] = True
+
+        upsert_events(filtered_events)
+        logger.info(f"Successfully marked {len(filtered_events)} events as filtered in database")
 
         # Step 4: Calculate summary statistics
         logger.info("Step 4: Calculating summary statistics...")
-        try:
-            total_candidates = len(filtered_events)
-            logger.info(f"Total candidates: {total_candidates}")
+        total_candidates = len(filtered_events)
 
-            if total_candidates > 0:
-                avg_liquidity = sum(float(event.get('liquidity', 0)) for event in filtered_events) / total_candidates
-                avg_volume = sum(float(event.get('volume', 0)) for event in filtered_events) / total_candidates
-                avg_days_until_end = sum(event.get('days_until_end', 0) or 0 for event in filtered_events if event.get('days_until_end') is not None) / len([e for e in filtered_events if e.get('days_until_end') is not None]) if any(e.get('days_until_end') is not None for e in filtered_events) else 0
-                logger.info(f"✓ Calculated stats - avg_liquidity: {avg_liquidity}, avg_volume: {avg_volume}, avg_days_until_end: {avg_days_until_end}")
-            else:
-                avg_liquidity = avg_volume = avg_days_until_end = 0
-                logger.info("No candidates found - all stats set to 0")
-        except Exception as stats_error:
-            logger.error(f"✗ Error calculating stats: {stats_error}")
-            avg_liquidity = avg_volume = avg_days_until_end = 0
+        if total_candidates > 0:
+            avg_liquidity = sum(float(event.get('liquidity', 0)) for event in filtered_events) / total_candidates
+            avg_volume = sum(float(event.get('volume', 0)) for event in filtered_events) / total_candidates
+            avg_days = sum(e.get('days_until_end', 0) or 0 for e in filtered_events if e.get('days_until_end')) / len([e for e in filtered_events if e.get('days_until_end')]) if any(e.get('days_until_end') for e in filtered_events) else 0
+        else:
+            avg_liquidity = avg_volume = avg_days = 0
 
-        logger.info("=== TRADING CANDIDATES FILTERING (JSON) COMPLETED SUCCESSFULLY ===")
+        logger.info("=== TRADING CANDIDATES FILTERING (DATABASE) COMPLETED ===")
 
         return {
-            "message": "Trading candidates filtered and exported successfully",
-            "source_file": events_path,
-            "output_file": output_path,
+            "message": "Trading candidates filtered and saved to database successfully",
             "total_candidates": total_candidates,
             "total_original_events": len(events_data),
             "filters_applied": {
@@ -538,20 +538,16 @@ async def filter_trading_candidates_json(
             "summary_stats": {
                 "avg_liquidity": round(avg_liquidity, 2) if avg_liquidity else None,
                 "avg_volume": round(avg_volume, 2) if avg_volume else None,
-                "avg_days_until_end": round(avg_days_until_end, 1) if avg_days_until_end else None
+                "avg_days_until_end": round(avg_days, 1) if avg_days else None
             },
             "timestamp": datetime.now().isoformat()
         }
 
     except HTTPException:
-        logger.error("Re-raising HTTPException")
         raise
     except Exception as e:
-        logger.error(f"=== UNEXPECTED ERROR IN FILTER_TRADING_CANDIDATES_JSON ===")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error(f"Error message: {str(e)}")
-        import traceback
-        logger.error(f"Full traceback: {traceback.format_exc()}")
+        logger.error(f"=== UNEXPECTED ERROR IN FILTER_TRADING_CANDIDATES ===")
+        logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 if __name__ == "__main__":

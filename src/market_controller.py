@@ -111,6 +111,11 @@ def apply_market_trading_filters(
                     continue
             
             # Filter by market conviction (abs(yes_price - no_price))
+            # Higher is more conviction.
+            # For example, if the yes_price is 0.6 and the no_price is 0.4, the market_conviction is 0.2.
+            # 0 Market conviction means that the market is perfectly balanced at 50/50.
+            # 1 Market conviction means that the market is very biased towards one outcome.
+            # 0.5 Market conviction means we have odds of 0.75 and 0.25 since 0.75 - 0.25 = 0.5.
             if min_market_conviction is not None or max_market_conviction is not None:
                 outcome_prices_str = market.get('outcomePrices', '[]')
                 try:
@@ -350,8 +355,8 @@ async def root():
     """Health check endpoint"""
     return {"message": "Polymarket Markets API is running", "timestamp": datetime.now().isoformat()}
 
-@app.get("/markets/export-filtered-markets-json")
-async def export_filtered_markets_json(
+@app.get("/markets/export-filtered-markets-db")
+async def export_filtered_markets_db(
     min_liquidity: float = 10000,
     min_volume: float = 50000,
     min_volume_24hr: Optional[float] = None,
@@ -359,129 +364,170 @@ async def export_filtered_markets_json(
     max_market_conviction: Optional[float] = None
 ):
     """
-    Export filtered markets to JSON
-    
+    Export filtered markets to database (Phase 4: Database version)
+
     Args:
         min_liquidity: Minimum liquidity threshold
         min_volume: Minimum total volume threshold
         min_volume_24hr: Minimum 24hr volume threshold
-        min_market_conviction: Minimum market conviction threshold (abs(yes_price - no_price))
-        max_market_conviction: Maximum market conviction threshold (abs(yes_price - no_price))
-        
+        min_market_conviction: Minimum market conviction threshold
+        max_market_conviction: Maximum market conviction threshold
+
     Returns:
-        JSON response with filtered market IDs and summary
+        JSON response with filtered market summary
     """
+    from src.db.operations import get_events, upsert_markets, insert_market_snapshot, clear_filtered_markets
+
     try:
-        logger.info("=== STARTING MARKET TRADING CANDIDATES FILTERING ===")
-        logger.info(f"Parameters received: min_liquidity={min_liquidity}, min_volume={min_volume}, min_volume_24hr={min_volume_24hr}")
-        logger.info(f"Conviction filters: min_market_conviction={min_market_conviction}, max_market_conviction={max_market_conviction}")
-        
-        # Ensure directories exist
-        ensure_data_directories()
-        
-        # Step 1: Read filtered events
-        events_path = os.path.join("data", "events", "filtered_events.json")
-        logger.info(f"Reading filtered events from: {events_path}")
-        
-        try:
-            with open(events_path, "r", encoding="utf-8") as f:
-                events_data = json.load(f)
-            logger.info(f"✓ Successfully loaded {len(events_data)} events")
-        except Exception as read_error:
-            logger.error(f"✗ Error reading events file: {read_error}")
-            raise HTTPException(status_code=500, detail=f"Error reading events file: {str(read_error)}")
-        
-        # Step 2: Extract markets from events
+        logger.info("=== STARTING MARKET FILTERING (DATABASE version) ===")
+        logger.info(f"Parameters: min_liquidity={min_liquidity}, min_volume={min_volume}")
+
+        # Step 1: Read filtered events from database
+        logger.info("Step 1: Loading filtered events from database...")
+        events_data = get_events({'is_filtered': True})
+
+        if not events_data:
+            raise HTTPException(status_code=500, detail="No filtered events found in database. Please filter events first.")
+
+        logger.info(f"Successfully loaded {len(events_data)} filtered events from database")
+
+        # Step 2: Extract markets from events (same as before)
         logger.info("Step 2: Extracting markets from events...")
         all_markets = extract_markets_from_events(events_data)
-        
+
         if not all_markets:
-            logger.warning("No markets found in filtered events")
             raise HTTPException(status_code=404, detail="No markets found in filtered events")
-        
-        # Step 3: Apply market filters
+
+        # Step 3: Apply market filters (same as before)
         logger.info("Step 3: Applying market trading filters...")
-        try:
-            filtered_markets = apply_market_trading_filters(
-                markets_list=all_markets,
-                min_liquidity=min_liquidity,
-                min_volume=min_volume,
-                min_volume_24hr=min_volume_24hr,
-                min_market_conviction=min_market_conviction,
-                max_market_conviction=max_market_conviction
-            )
-            logger.info(f"✓ Successfully applied filters. Filtered markets count: {len(filtered_markets)}")
-        except Exception as filter_error:
-            logger.error(f"✗ Error applying market filters: {filter_error}")
-            import traceback
-            logger.error(f"Filter error traceback: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=f"Error applying market filters: {str(filter_error)}")
-        
-        # Step 4: Get market IDs for API fetching
+        filtered_markets = apply_market_trading_filters(
+            markets_list=all_markets,
+            min_liquidity=min_liquidity,
+            min_volume=min_volume,
+            min_volume_24hr=min_volume_24hr,
+            min_market_conviction=min_market_conviction,
+            max_market_conviction=max_market_conviction
+        )
+        logger.info(f"Successfully applied filters. Filtered markets count: {len(filtered_markets)}")
+
+        # Step 4: Get market IDs for API fetching (same as before)
         logger.info("Step 4: Extracting market IDs for API fetching...")
         market_ids = extract_market_ids_from_filtered_markets(filtered_markets)
-        
+
         if not market_ids:
-            logger.warning("No market IDs after filtering")
             return {
                 "message": "No markets passed the trading filters",
                 "total_original_markets": len(all_markets),
                 "filtered_markets": 0,
-                "market_ids": [],
-                "filters_applied": {
-                    "min_liquidity": min_liquidity,
-                    "min_volume": min_volume,
-                    "min_volume_24hr": min_volume_24hr,
-                    "min_market_conviction": min_market_conviction,
-                    "max_market_conviction": max_market_conviction
-                },
                 "timestamp": datetime.now().isoformat()
             }
-        
-        # Step 5: Fetch detailed market data from API
+
+        # Step 5: Fetch detailed market data from API (same as before)
         logger.info("Step 5: Fetching detailed market data from API...")
         detailed_markets_data = fetch_all_markets_data(market_ids)
-        
+
         if not detailed_markets_data:
-            logger.error("No detailed market data retrieved")
             raise HTTPException(status_code=503, detail="Failed to fetch any detailed market data from API")
-        
-        # Step 6: Save to filtered_markets.json
-        logger.info("Step 6: Saving filtered markets data...")
-        filtered_markets_path = os.path.join("data", "markets", "filtered_markets.json")
-        
-        try:
-            with open(filtered_markets_path, "w", encoding="utf-8") as f:
-                json.dump(detailed_markets_data, f, indent=2, ensure_ascii=False)
-            logger.info(f"✓ Successfully saved {len(detailed_markets_data)} markets to: {filtered_markets_path}")
-        except Exception as save_error:
-            logger.error(f"✗ Error saving filtered markets: {save_error}")
-            raise HTTPException(status_code=500, detail=f"Error saving filtered markets: {str(save_error)}")
-        
+
+        # Step 6: Merge context and save to database instead of JSON
+        logger.info("Step 6: Merging event context and saving filtered markets to database...")
+
+        # Merge event context (event_id, event_title, event_end_date) and
+        # computed pricing (yes_price, no_price, market_conviction) from
+        # filtered_markets into detailed_markets_data by market id
+        context_by_id = {}
+        for m in filtered_markets:
+            mid = m.get('id')
+            if not mid:
+                continue
+            context_by_id[mid] = {
+                'event_id': m.get('event_id'),
+                'event_title': m.get('event_title'),
+                'event_end_date': m.get('event_end_date'),
+                'yes_price': m.get('yes_price'),
+                'no_price': m.get('no_price'),
+                'market_conviction': m.get('market_conviction')
+            }
+
+        for dm in detailed_markets_data:
+            mid = dm.get('id')
+            if not mid:
+                continue
+            ctx = context_by_id.get(mid)
+            if ctx:
+                # Only fill missing or null fields in detailed object
+                for k, v in ctx.items():
+                    if v is not None and (dm.get(k) is None):
+                        dm[k] = v
+
+        # If prices are still missing, try to compute from detailed response
+        for dm in detailed_markets_data:
+            if dm.get('yes_price') is None or dm.get('no_price') is None:
+                op = dm.get('outcomePrices')
+                try:
+                    if isinstance(op, str):
+                        import ast
+                        op_list = ast.literal_eval(op)
+                    else:
+                        op_list = op
+                    if op_list and len(op_list) >= 2:
+                        yes = float(op_list[0])
+                        no = float(op_list[1])
+                        dm['yes_price'] = yes
+                        dm['no_price'] = no
+                        dm['market_conviction'] = abs(yes - no)
+                except Exception:
+                    pass
+
+        # Ensure event_end_date is a datetime if it's still a string
+        from datetime import datetime as _dt
+        for dm in detailed_markets_data:
+            eed = dm.get('event_end_date')
+            if isinstance(eed, str):
+                try:
+                    dm['event_end_date'] = _dt.fromisoformat(eed.replace('Z', '+00:00'))
+                except Exception:
+                    # leave as-is if parsing fails
+                    pass
+
+        # Clear previous filtered flags
+        clear_filtered_markets()
+
+        # Mark as filtered
+        for market in detailed_markets_data:
+            market['is_filtered'] = True
+
+        upsert_markets(detailed_markets_data)
+
+        # Also save market snapshots for price history
+        for market in detailed_markets_data:
+            insert_market_snapshot(market['id'], {
+                'yes_price': market.get('yes_price'),
+                'no_price': market.get('no_price'),
+                'liquidity': market.get('liquidity'),
+                'volume': market.get('volume'),
+                'volume24hr': market.get('volume24hr'),
+                'market_conviction': market.get('market_conviction')
+            })
+
+        logger.info(f"Successfully saved {len(detailed_markets_data)} markets to database")
+
         # Step 7: Calculate summary statistics
         logger.info("Step 7: Calculating summary statistics...")
-        try:
-            total_filtered = len(detailed_markets_data)
-            if total_filtered > 0:
-                avg_liquidity = sum(float(m.get('liquidity', 0)) for m in detailed_markets_data) / total_filtered
-                avg_volume = sum(float(m.get('volume', 0)) for m in detailed_markets_data) / total_filtered
-                logger.info(f"✓ Calculated stats - avg_liquidity: {avg_liquidity}, avg_volume: {avg_volume}")
-            else:
-                avg_liquidity = avg_volume = 0
-        except Exception as stats_error:
-            logger.error(f"✗ Error calculating stats: {stats_error}")
+        total_filtered = len(detailed_markets_data)
+        if total_filtered > 0:
+            avg_liquidity = sum(float(m.get('liquidity', 0)) for m in detailed_markets_data) / total_filtered
+            avg_volume = sum(float(m.get('volume', 0)) for m in detailed_markets_data) / total_filtered
+        else:
             avg_liquidity = avg_volume = 0
-        
-        logger.info("=== MARKET TRADING CANDIDATES FILTERING COMPLETED SUCCESSFULLY ===")
-        
+
+        logger.info("=== MARKET FILTERING (DATABASE) COMPLETED ===")
+
         return {
-            "message": "Market trading candidates filtered and fetched successfully",
-            "source_file": events_path,
-            "output_file": filtered_markets_path,
+            "message": "Market trading candidates filtered and saved to database successfully",
             "total_original_markets": len(all_markets),
             "filtered_markets": len(filtered_markets),
             "fetched_detailed_markets": len(detailed_markets_data),
-            "market_ids": market_ids,
             "filters_applied": {
                 "min_liquidity": min_liquidity,
                 "min_volume": min_volume,
@@ -495,41 +541,37 @@ async def export_filtered_markets_json(
             },
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"=== UNEXPECTED ERROR IN MARKET TRADING CANDIDATES FILTERING ===")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error(f"Error message: {str(e)}")
-        import traceback
-        logger.error(f"Full traceback: {traceback.format_exc()}")
+        logger.error(f"=== UNEXPECTED ERROR IN MARKET FILTERING ===")
+        logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/markets/current-filtered")
 async def get_current_filtered_markets():
     """
-    Get current filtered markets data
-    
+    Get current filtered markets from database (Phase 4: Database version)
+
     Returns:
         Current filtered markets data
     """
+    from src.db.operations import get_markets
+
     try:
-        filtered_markets_path = os.path.join("data", "markets", "filtered_markets.json")
-        
-        if not os.path.exists(filtered_markets_path):
+        markets_data = get_markets({'is_filtered': True})
+
+        if not markets_data:
             raise HTTPException(status_code=404, detail="Filtered markets not found. Please filter trading candidates first.")
-        
-        with open(filtered_markets_path, "r", encoding="utf-8") as f:
-            markets_data = json.load(f)
-        
+
         return {
-            "message": "Current filtered markets retrieved",
+            "message": "Current filtered markets retrieved from database",
             "markets_count": len(markets_data),
             "markets": markets_data,
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
