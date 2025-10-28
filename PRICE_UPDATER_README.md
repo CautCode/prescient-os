@@ -8,10 +8,11 @@ The Price Updater is a **background thread** that automatically updates your por
 Without this, your portfolio P&L only updates once per trading cycle (e.g., daily). Market prices change constantly, so your portfolio value would be "frozen" and inaccurate between cycles.
 
 ### How It Works
-1. Runs in the background when `paper_trading_controller.py` starts
+1. Runs in background when `paper_trading_controller.py` starts
 2. Every 5 minutes (default), fetches current prices for all markets with open positions
 3. Recalculates P&L based on current prices
-4. Automatically saves updated portfolio
+4. Updates portfolio positions and state in PostgreSQL database
+5. Stores market price snapshots for time-series analysis
 
 ---
 
@@ -282,20 +283,28 @@ python -m uvicorn src.paper_trading_controller:app --reload --port 8003
 │   │  Price Updater Background Thread │          │
 │   │                                   │          │
 │   │  Every 5 minutes:                │          │
-│   │  1. Load portfolio                │          │
-│   │  2. Get open positions            │          │
+│   │  1. Load open positions from DB │          │
+│   │  2. Get market IDs               │          │
 │   │  3. Fetch current prices from API │ ─────┐  │
-│   │  4. Recalculate P&L               │      │  │
-│   │  5. Save portfolio                │      │  │
+│   │  4. Update P&L in database      │      │  │
+│   │  5. Store market snapshots       │      │  │
 │   └─────────────────────────────────┘      │  │
+│                │                            │  │
+│                ▼                            │  │
+│   ┌──────────────────────────┐             │  │
+│   │  PostgreSQL Database    │             │  │
+│   │  - portfolio_positions│             │  │
+│   │  - portfolio_state    │             │  │
+│   │  - market_snapshots   │             │  │
+│   └──────────────────────────┘             │  │
 │                                             │  │
 └─────────────────────────────────────────────┼──┘
-                                              │
-                                              ▼
-                            ┌──────────────────────────┐
-                            │  Polymarket API          │
-                            │  gamma-api.polymarket.com│
-                            └──────────────────────────┘
+                                               │
+                                               ▼
+                             ┌──────────────────────────┐
+                             │  Polymarket API          │
+                             │  gamma-api.polymarket.com│
+                             └──────────────────────────┘
 ```
 
 ---
@@ -312,21 +321,30 @@ python -m uvicorn src.paper_trading_controller:app --reload --port 8003
   - Lines 20-35: Import and lifecycle events
   - Lines 469-499: New `/update-prices` endpoint
   - Lines 501-556: Enhanced `/status` endpoint
+- ✅ `src/price_updater.py` - Updated for PostgreSQL integration
+  - Replaced JSON file operations with database operations
+  - Added market snapshot storage for time-series data
+  - Uses `get_portfolio_positions()`, `update_portfolio_position()`, `upsert_portfolio_state()`, `insert_market_snapshot()`
 
 ---
 
-## Next Steps
+## Database Integration Benefits
 
-### Phase 2: Price History Database (Optional)
+The price updater now integrates with PostgreSQL (Phase 1+):
 
-Once you're comfortable with periodic updates, consider implementing Solution 2 from [paper_trade.md](paper_trade.md):
+- **Real-time P&L Tracking**: Portfolio positions updated directly in database
+- **Market Snapshots**: Time-series price data stored for historical analysis
+- **Data Integrity**: All updates use ACID transactions
+- **Performance**: Database operations faster than JSON file I/O
+- **Analytics Ready**: Price history enables advanced analytics and backtesting
 
-- Store all price updates in PostgreSQL
-- Track historical P&L over time
-- Build analytics dashboard
-- Enable backtesting
+### Database Tables Used
 
-See [postgresql.md](postgresql.md) for the database migration plan.
+- `portfolio_positions` - Open positions with current P&L
+- `portfolio_state` - Overall portfolio state and total P&L  
+- `market_snapshots` - Time-series market price data
+
+See [postgresql.md](postgresql.md) for complete database migration plan.
 
 ---
 
@@ -342,6 +360,6 @@ See [postgresql.md](postgresql.md) for the database migration plan.
 
 ---
 
-**Version**: 1.0
-**Last Updated**: 2025-10-27
-**Implementation**: Solution 1 from paper_trade.md
+**Version**: 2.0
+**Last Updated**: 2025-10-28
+**Implementation**: PostgreSQL database integration (Phase 1+)

@@ -1,6 +1,7 @@
 # Price Updater - Background thread that periodically fetches current market prices and updates portfolio P&L
 # Main functions: start_price_updater(), stop_price_updater(), update_open_positions_prices()
 # Used by: paper_trading_controller.py to keep portfolio P&L accurate between trading cycles
+# Updated for PostgreSQL database integration (Phase 1+)
 
 import time
 import threading
@@ -62,16 +63,11 @@ class PriceUpdater:
     def update_open_positions_prices(self):
         """Fetch current prices for all markets with open positions and update P&L"""
         try:
-            # Step 1: Load portfolio to get open positions
-            portfolio_path = os.path.join("data", "trades", "portfolio.json")
-            if not os.path.exists(portfolio_path):
-                logger.debug("No portfolio file found, skipping update")
-                return
-
-            with open(portfolio_path, "r", encoding="utf-8") as f:
-                portfolio = json.load(f)
-
-            open_positions = [p for p in portfolio.get('positions', []) if p.get('status') == 'open']
+            # Step 1: Load portfolio from database to get open positions
+            from src.db.operations import get_portfolio_positions, upsert_portfolio_state, get_portfolio_state, insert_market_snapshot
+            
+            # Get open positions from database
+            open_positions = get_portfolio_positions(status='open')
 
             if not open_positions:
                 logger.debug("No open positions, skipping price update")
@@ -88,15 +84,14 @@ class PriceUpdater:
                 logger.warning("No prices fetched, skipping P&L update")
                 return
 
-            # Step 4: Update P&L using the update logic
-            # We need to import the update function, but avoid circular imports
-            self._update_portfolio_pnl(portfolio, current_prices)
+            # Step 4: Update P&L and save to database
+            self._update_portfolio_pnl_in_db(open_positions, current_prices)
 
-            # Step 5: Save updated portfolio
-            with open(portfolio_path, "w", encoding="utf-8") as f:
-                json.dump(portfolio, f, indent=2, ensure_ascii=False)
+            # Step 5: Store market snapshots for time-series data
+            for market_id, price_data in current_prices.items():
+                insert_market_snapshot(market_id, price_data)
 
-            logger.info(f"✓ Updated portfolio P&L: ${portfolio.get('total_profit_loss', 0):.2f}")
+            logger.info(f"✓ Updated portfolio P&L and stored market snapshots")
 
         except Exception as e:
             logger.error(f"Error updating open positions prices: {e}")
@@ -157,18 +152,17 @@ class PriceUpdater:
             logger.error(f"Error fetching market prices: {e}")
             return {}
 
-    def _update_portfolio_pnl(self, portfolio: Dict, current_prices: Dict[str, Dict]):
+    def _update_portfolio_pnl_in_db(self, open_positions: List[Dict], current_prices: Dict[str, Dict]):
         """
-        Update portfolio P&L based on current market prices
-        This is a simplified version of the update_portfolio_pnl function
+        Update portfolio P&L in database based on current market prices
         """
         try:
+            from src.db.operations import update_portfolio_position, get_portfolio_state, upsert_portfolio_state
+            
             total_pnl = 0.0
+            updated_positions = 0
 
-            for position in portfolio.get('positions', []):
-                if position.get('status') != 'open':
-                    continue
-
+            for position in open_positions:
                 market_id = position.get('market_id')
                 if market_id not in current_prices:
                     logger.warning(f"No current price for market {market_id}")
@@ -192,20 +186,30 @@ class PriceUpdater:
                 # Calculate P&L
                 # P&L = (current_price - entry_price) * amount
                 position_pnl = (current_price - entry_price) * amount
-                position['current_pnl'] = round(position_pnl, 2)
+                position_pnl_rounded = round(position_pnl, 2)
 
+                # Update position in database
+                update_portfolio_position(
+                    position['trade_id'], 
+                    {'current_pnl': position_pnl_rounded}
+                )
+                
                 total_pnl += position_pnl
+                updated_positions += 1
 
                 logger.debug(f"  Position {market_id}: entry={entry_price:.4f}, current={current_price:.4f}, P&L=${position_pnl:.2f}")
 
-            # Update portfolio total P&L
-            portfolio['total_profit_loss'] = round(total_pnl, 2)
-            portfolio['last_price_update'] = datetime.now().isoformat()
+            # Update portfolio state with new total P&L
+            portfolio_state = get_portfolio_state()
+            portfolio_state['total_profit_loss'] = round(total_pnl, 2)
+            portfolio_state['last_updated'] = datetime.now()
+            
+            upsert_portfolio_state(portfolio_state)
 
-            logger.info(f"Updated P&L for {len([p for p in portfolio.get('positions', []) if p.get('status') == 'open'])} open positions")
+            logger.info(f"Updated P&L for {updated_positions} open positions in database")
 
         except Exception as e:
-            logger.error(f"Error updating portfolio P&L: {e}")
+            logger.error(f"Error updating portfolio P&L in database: {e}")
             import traceback
             logger.error(traceback.format_exc())
 
