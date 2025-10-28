@@ -220,19 +220,12 @@ def update_portfolio_pnl(portfolio: Dict, current_market_data: Optional[List[Dic
     # Create market price lookup
     market_prices = {}
     for market in current_market_data:
-        market_id = market.get('id')
-        if market_id:
-            try:
-                outcome_prices_str = market.get('outcomePrices', '[]')
-                import ast
-                outcome_prices = ast.literal_eval(outcome_prices_str)
-                if len(outcome_prices) >= 2:
-                    market_prices[market_id] = {
-                        'yes_price': float(outcome_prices[0]),
-                        'no_price': float(outcome_prices[1])
-                    }
-            except:
-                continue
+        market_id = market.get('id') or market.get('market_id')
+        if market_id and market.get('yes_price') is not None and market.get('no_price') is not None:
+            market_prices[market_id] = {
+                'yes_price': float(market['yes_price']),
+                'no_price': float(market['no_price'])
+            }
     
     # Update P&L for each position
     total_unrealized_pnl = 0.0
@@ -283,20 +276,16 @@ async def execute_signals():
     try:
         logger.info("=== STARTING PAPER TRADING EXECUTION ===")
         
-        # Ensure directories exist
-        ensure_data_directories()
-        
-        # Step 1: Load current signals
-        signals_path = os.path.join("data", "trades", "current_signals.json")
-        logger.info(f"Reading trading signals from: {signals_path}")
-        
+        # Step 1: Load current signals from database
+        from src.db.operations import get_current_signals
+        logger.info("Reading trading signals from database")
+
         try:
-            with open(signals_path, "r", encoding="utf-8") as f:
-                signals = json.load(f)
-            logger.info(f"✓ Successfully loaded {len(signals)} trading signals")
+            signals = get_current_signals(executed=False)  # Only get unexecuted signals
+            logger.info(f"✓ Successfully loaded {len(signals)} trading signals from database")
         except Exception as read_error:
-            logger.error(f"✗ Error reading signals file: {read_error}")
-            raise HTTPException(status_code=500, detail=f"Error reading signals file: {str(read_error)}")
+            logger.error(f"✗ Error reading signals from database: {read_error}")
+            raise HTTPException(status_code=500, detail=f"Error reading signals from database: {str(read_error)}")
         
         if not signals:
             logger.warning("No trading signals found")
@@ -312,7 +301,7 @@ async def execute_signals():
         logger.info("Step 3: Executing trades...")
         execution_results = []
         executed_trades = []
-        
+
         for signal in signals:
             try:
                 result = execute_trade(signal, portfolio)
@@ -324,13 +313,20 @@ async def execute_signals():
                     "status": result['status'],
                     "reason": result['reason']
                 })
-                
+
                 if result['status'] == 'executed' and result['trade']:
                     executed_trades.append(result['trade'])
+                    # Mark signal as executed in database
+                    try:
+                        from src.db.operations import mark_signal_executed
+                        mark_signal_executed(signal['id'], result['trade']['trade_id'])
+                        logger.debug(f"Marked signal {signal['id']} as executed with trade_id {result['trade']['trade_id']}")
+                    except Exception as mark_error:
+                        logger.warning(f"Failed to mark signal {signal['id']} as executed: {mark_error}")
                     logger.debug(f"Executed: {signal['action']} {signal['market_id']} for ${signal['amount']}")
                 else:
                     logger.debug(f"Failed: {signal['market_id']} - {result['reason']}")
-                    
+
             except Exception as trade_error:
                 logger.warning(f"Error executing trade for market {signal.get('market_id', 'unknown')}: {trade_error}")
                 execution_results.append({
@@ -412,12 +408,11 @@ async def get_portfolio():
     try:
         portfolio = load_portfolio()
         
-        # Try to update P&L with current market data if available
+        # Try to update P&L with current market data from database
         try:
-            markets_path = os.path.join("data", "markets", "filtered_markets.json")
-            if os.path.exists(markets_path):
-                with open(markets_path, "r", encoding="utf-8") as f:
-                    market_data = json.load(f)
+            from src.db.operations import get_markets
+            market_data = get_markets(filters={'is_filtered': True})
+            if market_data:
                 update_portfolio_pnl(portfolio, market_data)
                 save_portfolio(portfolio)  # Save updated P&L
         except Exception as pnl_error:

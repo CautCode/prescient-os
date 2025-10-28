@@ -27,6 +27,8 @@ PAPER_TRADING_API_BASE = "http://localhost:8003"
 from src.db.operations import (
     insert_portfolio_history_snapshot,
     insert_signal_archive,
+    get_portfolio_history,
+    get_trades,
 )
 
 def call_api(url: str, method: str = "GET", timeout: int = 300) -> Optional[Dict]:
@@ -114,15 +116,15 @@ async def run_full_trading_cycle(
     event_min_liquidity: float = 10000,
     event_min_volume: float = 50000,
     event_min_volume_24hr: Optional[float] = None,
-    event_max_days_until_end: int = 90,
-    event_min_days_until_end: int = 1,
-    
-    # Market filtering parameters  
+    event_max_days_until_end: Optional[int] = None,
+    event_min_days_until_end: Optional[int] = None,
+
+    # Market filtering parameters
     min_liquidity: float = 10000,
     min_volume: float = 50000,
     min_volume_24hr: Optional[float] = None,
-    min_market_conviction: Optional[float] = None,
-    max_market_conviction: Optional[float] = None
+    min_market_conviction: Optional[float] = 0.5,
+    max_market_conviction: Optional[float] = 0.6
 ):
     """
     Run complete automated trading cycle with full control over filtering parameters
@@ -159,7 +161,7 @@ async def run_full_trading_cycle(
         
         # Step 1a: Export all active events (fetch and save raw events)
         logger.info("Step 1a: Exporting all active events...")
-        export_events_url = f"{EVENTS_API_BASE}/events/export-all-active-events-json"
+        export_events_url = f"{EVENTS_API_BASE}/events/export-all-active-events-db"
         export_response = call_api(export_events_url)
         
         if export_response:
@@ -186,7 +188,7 @@ async def run_full_trading_cycle(
         
         # Step 1b: Filter events for trading candidates
         logger.info("Step 1b: Filtering events for trading candidates...")
-        filter_events_url = f"{EVENTS_API_BASE}/events/filter-trading-candidates-json"
+        filter_events_url = f"{EVENTS_API_BASE}/events/filter-trading-candidates-db"
         event_params = {
             "min_liquidity": event_min_liquidity,
             "min_volume": event_min_volume,
@@ -225,7 +227,7 @@ async def run_full_trading_cycle(
         
         # Step 3: Filter Markets with user-controlled parameters
         logger.info("Step 3: Filtering markets...")
-        markets_url = f"{MARKETS_API_BASE}/markets/export-filtered-markets-json"
+        markets_url = f"{MARKETS_API_BASE}/markets/export-filtered-markets-db"
         market_params = {
             "min_liquidity": min_liquidity,
             "min_volume": min_volume,
@@ -488,16 +490,14 @@ async def get_performance_summary():
             "signals_history": {}
         }
         
-        # Portfolio History
-        portfolio_history_path = os.path.join("data", "history", "portfolio_history.json")
-        if os.path.exists(portfolio_history_path):
-            with open(portfolio_history_path, "r", encoding="utf-8") as f:
-                portfolio_history = json.load(f)
-            
+        # Portfolio History (from database)
+        try:
+            portfolio_history = get_portfolio_history(limit=100)  # Get last 100 snapshots
+
             if portfolio_history:
-                latest = portfolio_history[-1]
-                first = portfolio_history[0]
-                
+                latest = portfolio_history[0]  # Most recent first
+                first = portfolio_history[-1]  # Oldest last
+
                 summary["portfolio_performance"] = {
                     "days_tracked": len(portfolio_history),
                     "starting_balance": first.get('balance', 0),
@@ -507,19 +507,21 @@ async def get_performance_summary():
                     "current_open_positions": latest.get('open_positions', 0),
                     "total_trades": latest.get('trade_count', 0)
                 }
+        except Exception as e:
+            logger.warning(f"Could not load portfolio history from database: {e}")
         
-        # Trading History
-        trades_path = os.path.join("data", "trades", "paper_trades.json")
-        if os.path.exists(trades_path):
-            with open(trades_path, "r", encoding="utf-8") as f:
-                trades = json.load(f)
-            
+        # Trading History (from database)
+        try:
+            trades = get_trades(limit=1000)  # Get last 1000 trades
+
             summary["trading_history"] = {
                 "total_trades": len(trades),
                 "total_amount_traded": sum(trade.get('amount', 0) for trade in trades),
                 "buy_yes_trades": len([t for t in trades if t.get('action') == 'buy_yes']),
                 "buy_no_trades": len([t for t in trades if t.get('action') == 'buy_no'])
             }
+        except Exception as e:
+            logger.warning(f"Could not load trading history from database: {e}")
         
         # Current Portfolio
         portfolio_response = call_api(f"{PAPER_TRADING_API_BASE}/paper-trading/portfolio", timeout=10)
