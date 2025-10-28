@@ -16,6 +16,24 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Polymarket Paper Trading API", version="1.0.0")
 
+# Import price updater
+from src.price_updater import start_price_updater, stop_price_updater, get_price_updater
+
+# FastAPI lifecycle events
+@app.on_event("startup")
+async def startup_event():
+    """Start price updater when app starts"""
+    # Get update interval from environment variable (default 5 minutes)
+    update_interval = int(os.getenv('PRICE_UPDATE_INTERVAL', '300'))
+    start_price_updater(update_interval)
+    logger.info(f"✓ Price updater started with {update_interval}s interval")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop price updater when app shuts down"""
+    stop_price_updater()
+    logger.info("Price updater stopped")
+
 # Helper Functions
 def ensure_data_directories():
     """
@@ -448,11 +466,43 @@ async def get_trades_history():
         logger.error(f"Error getting trades history: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting trades history: {str(e)}")
 
+@app.get("/paper-trading/update-prices")
+async def update_prices():
+    """
+    Manually trigger price update for open positions
+
+    Returns:
+        Price update result
+    """
+    try:
+        updater = get_price_updater()
+        if updater:
+            logger.info("Manual price update triggered")
+            updater.update_open_positions_prices()
+
+            # Get updated portfolio
+            portfolio = load_portfolio()
+
+            return {
+                "message": "Price update completed",
+                "portfolio_pnl": portfolio.get('total_profit_loss', 0),
+                "open_positions": len([p for p in portfolio.get('positions', []) if p.get('status') == 'open']),
+                "last_price_update": portfolio.get('last_price_update'),
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=503, detail="Price updater not running")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating prices: {e}")
+        raise HTTPException(status_code=500, detail=f"Error updating prices: {str(e)}")
+
 @app.get("/paper-trading/status")
 async def get_paper_trading_status():
     """
     Get status of paper trading system
-    
+
     Returns:
         Status information about portfolio and trades
     """
@@ -463,9 +513,17 @@ async def get_paper_trading_status():
             "portfolio_balance": 0.0,
             "open_positions": 0,
             "total_trades": 0,
-            "trades_history_exists": False
+            "trades_history_exists": False,
+            "price_updater_running": False,
+            "price_update_interval": None
         }
-        
+
+        # Check price updater status
+        updater = get_price_updater()
+        if updater:
+            status["price_updater_running"] = updater.running
+            status["price_update_interval"] = updater.update_interval
+
         # Check portfolio
         portfolio_path = os.path.join("data", "trades", "portfolio.json")
         if os.path.exists(portfolio_path):
@@ -476,9 +534,10 @@ async def get_paper_trading_status():
                 status["open_positions"] = len([p for p in portfolio.get('positions', []) if p.get('status') == 'open'])
                 status["total_trades"] = portfolio.get('trade_count', 0)
                 status["portfolio_last_updated"] = portfolio.get('last_updated')
+                status["last_price_update"] = portfolio.get('last_price_update')
             except:
                 pass
-        
+
         # Check trades history
         trades_path = os.path.join("data", "trades", "paper_trades.json")
         if os.path.exists(trades_path):
@@ -489,9 +548,9 @@ async def get_paper_trading_status():
                     status["trades_in_history"] = len(trades_history)
             except:
                 pass
-        
+
         return status
-        
+
     except Exception as e:
         logger.error(f"Error getting paper trading status: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting paper trading status: {str(e)}")
