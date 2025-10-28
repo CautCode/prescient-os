@@ -629,3 +629,116 @@ def clear_filtered_markets():
     with get_db() as db:
         db.execute(text("UPDATE markets SET is_filtered = FALSE WHERE is_filtered = TRUE"))
         db.commit()
+
+
+# ============================================================================
+# HISTORY OPERATIONS (Phase 2)
+# ============================================================================
+
+def insert_portfolio_history_snapshot(snapshot: Dict) -> int:
+    """Insert a single portfolio history snapshot and return its id."""
+    with get_db() as db:
+        result = db.execute(text("""
+            INSERT INTO portfolio_history
+            (snapshot_date, timestamp, balance, total_invested, total_profit_loss,
+             total_value, open_positions, trade_count)
+            VALUES (:snapshot_date, :timestamp, :balance, :total_invested, :total_profit_loss,
+                    :total_value, :open_positions, :trade_count)
+            RETURNING id
+        """), snapshot)
+        inserted_id = result.scalar_one()
+        db.commit()
+        return int(inserted_id)
+
+
+def get_portfolio_history(limit: Optional[int] = None) -> List[Dict]:
+    """Return recent portfolio history rows ordered by date/time descending."""
+    with get_db() as db:
+        query = (
+            """
+            SELECT id, snapshot_date, timestamp, balance, total_invested,
+                   total_profit_loss, total_value, open_positions, trade_count
+            FROM portfolio_history
+            ORDER BY snapshot_date DESC, timestamp DESC
+            """
+        )
+
+        params: Dict = {}
+        if limit:
+            query += " LIMIT :limit"
+            params["limit"] = limit
+
+        rows = db.execute(text(query), params).fetchall()
+        results: List[Dict] = []
+        for row in rows:
+            results.append({
+                'id': int(row[0]),
+                'snapshot_date': row[1],
+                'timestamp': row[2],
+                'balance': float(row[3]) if row[3] is not None else None,
+                'total_invested': float(row[4]) if row[4] is not None else None,
+                'total_profit_loss': float(row[5]) if row[5] is not None else None,
+                'total_value': float(row[6]) if row[6] is not None else None,
+                'open_positions': int(row[7]) if row[7] is not None else 0,
+                'trade_count': int(row[8]) if row[8] is not None else 0,
+            })
+        return results
+
+
+def insert_signal_archive(archived_at: datetime, signals: List[Dict]) -> int:
+    """Insert a signal archive row storing signals JSON and return its id."""
+    archive_month = archived_at.strftime('%Y-%m')
+    signals_count = len(signals) if signals else 0
+    signals_json = json.dumps(signals, default=_json_default_serializer)
+
+    with get_db() as db:
+        result = db.execute(text("""
+            INSERT INTO signal_archives
+            (archived_at, archive_month, signals_count, signals_data)
+            VALUES (:archived_at, :archive_month, :signals_count, CAST(:signals_data AS jsonb))
+            RETURNING id
+        """), {
+            'archived_at': archived_at,
+            'archive_month': archive_month,
+            'signals_count': signals_count,
+            'signals_data': signals_json,
+        })
+        inserted_id = result.scalar_one()
+        db.commit()
+        return int(inserted_id)
+
+
+def get_recent_signal_archives(limit: Optional[int] = None) -> List[Dict]:
+    """Return recent signal archives ordered by archived_at DESC."""
+    with get_db() as db:
+        query = (
+            """
+            SELECT id, archived_at, archive_month, signals_count, signals_data
+            FROM signal_archives
+            ORDER BY archived_at DESC
+            """
+        )
+
+        params: Dict = {}
+        if limit:
+            query += " LIMIT :limit"
+            params["limit"] = limit
+
+        rows = db.execute(text(query), params).fetchall()
+        results: List[Dict] = []
+        for row in rows:
+            signals_data = row[4]
+            if isinstance(signals_data, str):
+                try:
+                    signals_data = json.loads(signals_data)
+                except Exception:
+                    signals_data = []
+
+            results.append({
+                'id': int(row[0]),
+                'archived_at': row[1],
+                'archive_month': row[2],
+                'signals_count': int(row[3]) if row[3] is not None else 0,
+                'signals_data': signals_data if signals_data is not None else [],
+            })
+        return results

@@ -23,6 +23,11 @@ MARKETS_API_BASE = "http://localhost:8001"
 STRATEGY_API_BASE = "http://localhost:8002"
 PAPER_TRADING_API_BASE = "http://localhost:8003"
 
+# DB operations (Phase 2 - History)
+from src.db.operations import (
+    insert_portfolio_history_snapshot,
+    insert_signal_archive,
+)
 
 def call_api(url: str, method: str = "GET", timeout: int = 300) -> Optional[Dict]:
     """
@@ -53,88 +58,49 @@ def ensure_data_directories():
 
 def create_daily_portfolio_snapshot(portfolio_data: Dict):
     """
-    Create daily portfolio snapshot for historical tracking
-    
-    Args:
-        portfolio_data: Current portfolio state
+    Create daily portfolio snapshot (DB-only, Phase 2).
     """
     try:
-        history_path = os.path.join("data", "history", "portfolio_history.json")
-        
-        # Load existing history or start with empty list
-        if os.path.exists(history_path):
-            with open(history_path, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        else:
-            history = []
-        
-        # Create snapshot
+        now = datetime.now()
+        open_positions = len([p for p in portfolio_data.get('positions', []) if p.get('status') == 'open'])
         snapshot = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "timestamp": datetime.now().isoformat(),
-            "balance": portfolio_data.get('balance', 0),
-            "total_invested": portfolio_data.get('total_invested', 0),
-            "total_profit_loss": portfolio_data.get('total_profit_loss', 0),
-            "total_value": portfolio_data.get('balance', 0) + portfolio_data.get('total_profit_loss', 0),
-            "open_positions": len([p for p in portfolio_data.get('positions', []) if p.get('status') == 'open']),
-            "trade_count": portfolio_data.get('trade_count', 0)
+            'snapshot_date': now.date(),
+            'timestamp': now,
+            'balance': portfolio_data.get('balance', 0),
+            'total_invested': portfolio_data.get('total_invested', 0),
+            'total_profit_loss': portfolio_data.get('total_profit_loss', 0),
+            'total_value': portfolio_data.get('balance', 0) + portfolio_data.get('total_profit_loss', 0),
+            'open_positions': open_positions,
+            'trade_count': portfolio_data.get('trade_count', 0),
         }
-        
-        # Append snapshot (APPEND ONLY as per MVP spec)
-        history.append(snapshot)
-        
-        # Save back to file
-        with open(history_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"Created daily portfolio snapshot: ${snapshot['total_value']:.2f} total value")
-        
+        snapshot_id = insert_portfolio_history_snapshot(snapshot)
+        logger.info(
+            f"Inserted portfolio snapshot id={snapshot_id} total_value={snapshot['total_value']:.2f}"
+        )
     except Exception as e:
-        logger.error(f"Error creating portfolio snapshot: {e}")
+        logger.error(f"Error creating portfolio snapshot (DB): {e}")
 
 def archive_current_signals():
     """
-    Archive current signals to monthly file
+    Archive current signals (DB-only, Phase 2).
+    Reads current signals from existing JSON file if present and inserts into DB archive.
     """
     try:
         signals_path = os.path.join("data", "trades", "current_signals.json")
         if not os.path.exists(signals_path):
             return
-        
-        # Read current signals
+
         with open(signals_path, "r", encoding="utf-8") as f:
             signals = json.load(f)
-        
+
         if not signals:
             return
-        
-        # Create monthly archive filename
-        current_month = datetime.now().strftime("%Y-%m")
-        archive_path = os.path.join("data", "history", f"signals_archive_{current_month}.json")
-        
-        # Load existing archive or start with empty list
-        if os.path.exists(archive_path):
-            with open(archive_path, "r", encoding="utf-8") as f:
-                archive = json.load(f)
-        else:
-            archive = []
-        
-        # Add signals with archive timestamp
-        archive_entry = {
-            "archived_at": datetime.now().isoformat(),
-            "signals_count": len(signals),
-            "signals": signals
-        }
-        archive.append(archive_entry)
-        
-        # Save archive (NEW FILE MONTHLY as per MVP spec)
-        with open(archive_path, "w", encoding="utf-8") as f:
-            json.dump(archive, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"Archived {len(signals)} signals to {archive_path}")
-        
+
+        archived_at = datetime.now()
+        archive_id = insert_signal_archive(archived_at, signals)
+        logger.info(f"Archived {len(signals)} signals to DB (archive_id={archive_id})")
     except Exception as e:
-        logger.error(f"Error archiving signals: {e}")
+        logger.error(f"Error archiving signals (DB): {e}")
 
 # API Endpoints
 @app.get("/")
@@ -573,4 +539,4 @@ async def get_performance_summary():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8004)
-    # uvicorn src.trading_controller:app --reload --port 8
+    # uvicorn src.trading_controller:app --reload --port 8000
