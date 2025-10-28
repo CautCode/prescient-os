@@ -287,6 +287,121 @@ def update_trade_status(trade_id: str, status: str, pnl: float = None):
 
 
 # ============================================================================
+# SIGNAL OPERATIONS (Phase 3)
+# ============================================================================
+
+def insert_signal(signal: Dict) -> int:
+    """Insert a single trading signal and return its generated id."""
+    with get_db() as db:
+        result = db.execute(text("""
+            INSERT INTO trading_signals
+            (timestamp, market_id, market_question, action, target_price, amount,
+             confidence, reason, yes_price, no_price, market_liquidity, market_volume,
+             event_id, event_title, event_end_date, executed, executed_at, trade_id)
+            VALUES (:timestamp, :market_id, :market_question, :action, :target_price, :amount,
+                    :confidence, :reason, :yes_price, :no_price, :market_liquidity, :market_volume,
+                    :event_id, :event_title, :event_end_date, :executed, :executed_at, :trade_id)
+            RETURNING id
+        """), signal)
+        inserted_id = result.scalar_one()
+        db.commit()
+        return int(inserted_id)
+
+
+def insert_signals(signals: List[Dict]) -> List[int]:
+    """Bulk insert trading signals in a single transaction; returns list of ids."""
+    if not signals:
+        return []
+
+    with get_db() as db:
+        inserted_ids: List[int] = []
+        for signal in signals:
+            result = db.execute(text("""
+                INSERT INTO trading_signals
+                (timestamp, market_id, market_question, action, target_price, amount,
+                 confidence, reason, yes_price, no_price, market_liquidity, market_volume,
+                 event_id, event_title, event_end_date, executed, executed_at, trade_id)
+                VALUES (:timestamp, :market_id, :market_question, :action, :target_price, :amount,
+                        :confidence, :reason, :yes_price, :no_price, :market_liquidity, :market_volume,
+                        :event_id, :event_title, :event_end_date, :executed, :executed_at, :trade_id)
+                RETURNING id
+            """), signal)
+            inserted_ids.append(int(result.scalar_one()))
+        db.commit()
+        return inserted_ids
+
+
+def get_current_signals(limit: Optional[int] = None, executed: Optional[bool] = None) -> List[Dict]:
+    """Query current signals ordered by timestamp DESC with optional executed filter and limit."""
+    with get_db() as db:
+        base_query = """
+            SELECT id, timestamp, market_id, market_question, action, target_price, amount,
+                   confidence, reason, yes_price, no_price, market_liquidity, market_volume,
+                   event_id, event_title, event_end_date, executed, executed_at, trade_id
+            FROM trading_signals
+        """
+
+        clauses = []
+        params: Dict = {}
+        if executed is not None:
+            clauses.append("executed = :executed")
+            params['executed'] = executed
+
+        if clauses:
+            base_query += " WHERE " + " AND ".join(clauses)
+
+        base_query += " ORDER BY timestamp DESC"
+
+        if limit:
+            base_query += " LIMIT :limit"
+            params['limit'] = limit
+
+        rows = db.execute(text(base_query), params).fetchall()
+
+        results: List[Dict] = []
+        for row in rows:
+            results.append({
+                'id': int(row[0]),
+                'timestamp': row[1],
+                'market_id': row[2],
+                'market_question': row[3],
+                'action': row[4],
+                'target_price': float(row[5]) if row[5] is not None else None,
+                'amount': float(row[6]) if row[6] is not None else None,
+                'confidence': float(row[7]) if row[7] is not None else None,
+                'reason': row[8],
+                'yes_price': float(row[9]) if row[9] is not None else None,
+                'no_price': float(row[10]) if row[10] is not None else None,
+                'market_liquidity': float(row[11]) if row[11] is not None else None,
+                'market_volume': float(row[12]) if row[12] is not None else None,
+                'event_id': row[13],
+                'event_title': row[14],
+                'event_end_date': row[15],
+                'executed': bool(row[16]) if row[16] is not None else False,
+                'executed_at': row[17],
+                'trade_id': row[18]
+            })
+        return results
+
+
+def mark_signal_executed(signal_id: int, trade_id: str, executed_at: Optional[datetime] = None):
+    """Mark a signal executed and link to a trade id."""
+    with get_db() as db:
+        db.execute(text("""
+            UPDATE trading_signals
+            SET executed = TRUE,
+                executed_at = COALESCE(:executed_at, NOW()),
+                trade_id = :trade_id
+            WHERE id = :signal_id
+        """), {
+            'signal_id': signal_id,
+            'trade_id': trade_id,
+            'executed_at': executed_at
+        })
+        db.commit()
+
+
+# ============================================================================
 # EVENT OPERATIONS (Phase 4)
 # ============================================================================
 

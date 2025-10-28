@@ -1,6 +1,6 @@
 # Trading Controller - Orchestrates full trading cycle, coordinates all controllers, provides system status
 # Main functions: run_full_trading_cycle(), get_trading_status(), get_performance_summary()
-# Used by: Main entry point for automated trading operations, coordinates events->markets->strategy->execution
+# Used by: Main entry point for automated trading operations, coordinates events->markets->strategy->execution (paper trading)
 
 from fastapi import FastAPI, HTTPException
 from typing import Dict, List, Optional

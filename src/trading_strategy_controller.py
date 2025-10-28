@@ -19,9 +19,13 @@ app = FastAPI(title="Polymarket Trading Strategy API", version="1.0.0")
 # Helper Functions
 def ensure_data_directories():
     """
-    Create necessary data directories if they don't exist
+    Deprecated: directories are no longer required for DB-only signal writes.
+    Left as a no-op for backward compatibility.
     """
-    os.makedirs("data/trades", exist_ok=True)
+    try:
+        os.makedirs("data/trades", exist_ok=True)
+    except Exception:
+        pass
 
 def generate_trading_signals(market_data: List[Dict]) -> List[Dict]:
     """
@@ -131,13 +135,10 @@ async def generate_signals():
     Returns:
         JSON response with generated signals and summary
     """
-    from src.db.operations import get_markets
+    from src.db.operations import get_markets, insert_signals
 
     try:
         logger.info("=== STARTING TRADING SIGNAL GENERATION ===")
-
-        # Ensure directories exist (still needed for saving signals to JSON)
-        ensure_data_directories()
 
         # Step 1: Read filtered markets from DATABASE (not JSON)
         logger.info("Step 1: Loading filtered markets from database...")
@@ -159,19 +160,48 @@ async def generate_signals():
             import traceback
             logger.error(f"Signal generation traceback: {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=f"Error generating signals: {str(signal_error)}")
-        
-        # Step 3: Save signals to current_signals.json
-        logger.info("Step 3: Saving trading signals...")
-        signals_path = os.path.join("data", "trades", "current_signals.json")
-        
+
+        # Step 3: Persist signals to DATABASE (DB-only; no JSON writes)
+        logger.info("Step 3: Persisting trading signals to database...")
         try:
-            with open(signals_path, "w", encoding="utf-8") as f:
-                json.dump(signals, f, indent=2, ensure_ascii=False)
-            logger.info(f"✓ Successfully saved {len(signals)} signals to: {signals_path}")
-        except Exception as save_error:
-            logger.error(f"✗ Error saving signals: {save_error}")
-            raise HTTPException(status_code=500, detail=f"Error saving signals: {str(save_error)}")
-        
+            prepared = []
+            for s in signals:
+                # Convert timestamp to datetime object if needed
+                ts = s.get('timestamp')
+                if isinstance(ts, str):
+                    try:
+                        ts = datetime.fromisoformat(ts)
+                    except Exception:
+                        ts = datetime.now()
+                # event_end_date may already be datetime
+                eed = s.get('event_end_date')
+                prepared.append({
+                    'timestamp': ts,
+                    'market_id': s.get('market_id'),
+                    'market_question': s.get('market_question'),
+                    'action': s.get('action'),
+                    'target_price': float(s.get('target_price')) if s.get('target_price') is not None else None,
+                    'amount': float(s.get('amount')) if s.get('amount') is not None else None,
+                    'confidence': float(s.get('confidence')) if s.get('confidence') is not None else None,
+                    'reason': s.get('reason'),
+                    'yes_price': float(s.get('yes_price')) if s.get('yes_price') is not None else None,
+                    'no_price': float(s.get('no_price')) if s.get('no_price') is not None else None,
+                    'market_liquidity': float(s.get('market_liquidity')) if s.get('market_liquidity') is not None else None,
+                    'market_volume': float(s.get('market_volume')) if s.get('market_volume') is not None else None,
+                    'event_id': s.get('event_id'),
+                    'event_title': s.get('event_title'),
+                    'event_end_date': eed,
+                    'executed': False,
+                    'executed_at': None,
+                    'trade_id': None
+                })
+
+            inserted_ids = insert_signals(prepared)
+            logger.info(f"✓ Inserted {len(inserted_ids)} signals into database")
+        except Exception as db_error:
+            logger.error(f"✗ Error inserting signals into database: {db_error}")
+            raise HTTPException(status_code=500, detail=f"Error persisting signals: {str(db_error)}")
+
         # Step 4: Calculate summary statistics
         logger.info("Step 4: Calculating summary statistics...")
         try:
@@ -196,8 +226,7 @@ async def generate_signals():
         
         return {
             "message": "Trading signals generated successfully",
-            "source_file": markets_path,
-            "output_file": signals_path,
+            "persistence": "database",
             "total_markets_analyzed": len(markets_data),
             "total_signals_generated": total_signals,
             "signal_breakdown": {
@@ -232,25 +261,22 @@ async def get_current_signals():
         Current trading signals data
     """
     try:
-        signals_path = os.path.join("data", "trades", "current_signals.json")
-        
-        if not os.path.exists(signals_path):
+        from src.db.operations import get_current_signals as db_get_current_signals
+        signals_data = db_get_current_signals(executed=False)
+        if not signals_data:
             raise HTTPException(status_code=404, detail="No trading signals found. Please generate signals first.")
-        
-        with open(signals_path, "r", encoding="utf-8") as f:
-            signals_data = json.load(f)
-        
+
         return {
             "message": "Current trading signals retrieved",
             "signals_count": len(signals_data),
             "signals": signals_data,
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error reading trading signals: {e}")
+        logger.error(f"Error fetching trading signals from database: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trading signals: {str(e)}")
 
 @app.get("/strategy/status")
@@ -262,6 +288,8 @@ async def get_strategy_status():
         Status information about signals and strategy
     """
     try:
+        from src.db.operations import get_current_signals as db_get_current_signals
+
         status = {
             "timestamp": datetime.now().isoformat(),
             "signals_exist": False,
@@ -269,29 +297,25 @@ async def get_strategy_status():
             "signals_last_generated": None,
             "strategy_type": ">50% buy strategy"
         }
-        
-        # Check current signals
-        signals_path = os.path.join("data", "trades", "current_signals.json")
-        if os.path.exists(signals_path):
-            status["signals_exist"] = True
-            status["signals_last_generated"] = datetime.fromtimestamp(os.path.getmtime(signals_path)).isoformat()
-            
-            try:
-                with open(signals_path, "r", encoding="utf-8") as f:
-                    signals_data = json.load(f)
-                    status["signals_count"] = len(signals_data)
-                    
-                    # Add signal breakdown
-                    if signals_data:
-                        buy_yes = len([s for s in signals_data if s.get('action') == 'buy_yes'])
-                        buy_no = len([s for s in signals_data if s.get('action') == 'buy_no'])
-                        status["signal_breakdown"] = {
-                            "buy_yes_signals": buy_yes,
-                            "buy_no_signals": buy_no
-                        }
-            except:
-                pass
-        
+
+        try:
+            recent = db_get_current_signals(limit=1)
+            all_signals = db_get_current_signals(limit=100)
+            if recent:
+                status["signals_exist"] = True
+                # recent[0]['timestamp'] is datetime from DB ops
+                last_ts = recent[0].get('timestamp')
+                status["signals_last_generated"] = last_ts.isoformat() if hasattr(last_ts, 'isoformat') else str(last_ts)
+                status["signals_count"] = len(all_signals)
+                buy_yes = len([s for s in all_signals if s.get('action') == 'buy_yes'])
+                buy_no = len([s for s in all_signals if s.get('action') == 'buy_no'])
+                status["signal_breakdown"] = {
+                    "buy_yes_signals": buy_yes,
+                    "buy_no_signals": buy_no
+                }
+        except Exception:
+            pass
+
         return status
         
     except Exception as e:
