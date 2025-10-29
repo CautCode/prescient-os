@@ -300,7 +300,7 @@ async def execute_signals():
         # Step 3: Execute trades
         logger.info("Step 3: Executing trades...")
         execution_results = []
-        executed_trades = []
+        executed_trades = []  # Will store tuples of (signal_id, trade)
 
         for signal in signals:
             try:
@@ -315,14 +315,7 @@ async def execute_signals():
                 })
 
                 if result['status'] == 'executed' and result['trade']:
-                    executed_trades.append(result['trade'])
-                    # Mark signal as executed in database
-                    try:
-                        from src.db.operations import mark_signal_executed
-                        mark_signal_executed(signal['id'], result['trade']['trade_id'])
-                        logger.debug(f"Marked signal {signal['id']} as executed with trade_id {result['trade']['trade_id']}")
-                    except Exception as mark_error:
-                        logger.warning(f"Failed to mark signal {signal['id']} as executed: {mark_error}")
+                    executed_trades.append((signal['id'], result['trade']))
                     logger.debug(f"Executed: {signal['action']} {signal['market_id']} for ${signal['amount']}")
                 else:
                     logger.debug(f"Failed: {signal['market_id']} - {result['reason']}")
@@ -350,8 +343,15 @@ async def execute_signals():
         # Step 5: Append trades to history
         logger.info("Step 5: Saving trades to permanent history...")
         try:
-            for trade in executed_trades:
+            for signal_id, trade in executed_trades:
                 append_trade_to_history(trade)
+                # Mark signal as executed in database after trade is saved
+                try:
+                    from src.db.operations import mark_signal_executed
+                    mark_signal_executed(signal_id, trade['trade_id'])
+                    logger.debug(f"Marked signal {signal_id} as executed with trade_id {trade['trade_id']}")
+                except Exception as mark_error:
+                    logger.warning(f"Failed to mark signal {signal_id} as executed: {mark_error}")
             logger.info(f"✓ Appended {len(executed_trades)} trades to history")
         except Exception as history_error:
             logger.error(f"✗ Error saving trade history: {history_error}")
@@ -363,7 +363,7 @@ async def execute_signals():
         executed_count = len(executed_trades)
         failed_count = len([r for r in execution_results if r['status'] == 'failed'])
         error_count = len([r for r in execution_results if r['status'] == 'error'])
-        total_invested = sum(trade['amount'] for trade in executed_trades)
+        total_invested = sum(trade['amount'] for _, trade in executed_trades)
         
         logger.info("=== PAPER TRADING EXECUTION COMPLETED ===")
         

@@ -93,8 +93,23 @@ def apply_json_trading_filters(
             end_date_str = event.get('endDate')
             if end_date_str:
                 try:
-                    end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-                    days_diff = (end_date.replace(tzinfo=None) - current_time).days
+                    # Handle different date formats
+                    if isinstance(end_date_str, str):
+                        if 'T' in end_date_str:
+                            end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                        else:
+                            # Handle date-only strings
+                            end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+                    else:
+                        # Handle if it's already a datetime object
+                        end_date = end_date_str
+                    
+                    # Remove timezone info for consistent comparison
+                    if end_date.tzinfo is not None:
+                        end_date = end_date.replace(tzinfo=None)
+                    
+                    # Calculate days difference
+                    days_diff = (end_date - current_time.replace(tzinfo=None)).days
                     filtered_event['days_until_end'] = days_diff
                 except Exception as date_error:
                     logger.debug(f"Error calculating days for date '{end_date_str}': {date_error}")
