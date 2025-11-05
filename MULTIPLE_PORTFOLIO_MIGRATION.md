@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This document provides an in-depth implementation guide for expanding Prescient OS to support multiple portfolios with independent trading strategies and P&L tracking. The Portfolio-Centric Architecture approach provides true isolation between portfolios, enabling:
+This document provides an implementation guide for expanding Prescient OS to support multiple portfolios with independent trading strategies and P&L tracking. The Portfolio-Centric Architecture approach provides true isolation between portfolios, enabling:
 
 - **Multiple concurrent strategies** running independently
 - **Separate capital allocation** per portfolio
@@ -10,9 +10,26 @@ This document provides an in-depth implementation guide for expanding Prescient 
 - **Strategy comparison** and A/B testing
 - **Scalable architecture** for professional trading operations
 
-**Implementation Complexity**: High
-**Estimated Timeline**: 6 weeks
+**Implementation Complexity**: Medium
+**Estimated Timeline**: 2-3 weeks
 **Business Value**: Very High
+
+## Migration Strategy
+
+**DECISION: Drop and Rebuild Database**
+
+Since this is a fundamental architecture change and we don't need to preserve existing data, we'll:
+1. Create a completely new schema with portfolio support built-in
+2. Drop the old database locally
+3. Create fresh database with new schema
+4. Commit schema changes to git with clear commit message
+
+**Why no migration script?**
+- No production data to preserve
+- Fundamental paradigm shift (single → multi-portfolio)
+- Simpler and faster implementation
+- Old schema is preserved in git history
+- Reduces complexity and testing burden
 
 ---
 
@@ -20,17 +37,13 @@ This document provides an in-depth implementation guide for expanding Prescient 
 
 1. [Current System Analysis](#current-system-analysis)
 2. [Portfolio-Centric Architecture Overview](#portfolio-centric-architecture-overview)
-3. [Database Migration Design](#database-migration-design)
+3. [New Database Schema](#new-database-schema)
 4. [Database Operations Layer Changes](#database-operations-layer-changes)
 5. [Controller Architecture Changes](#controller-architecture-changes)
 6. [Price Updater Modifications](#price-updater-modifications)
 7. [Trading Cycle Orchestration](#trading-cycle-orchestration)
-8. [Migration Script Implementation](#migration-script-implementation)
+8. [Implementation Steps](#implementation-steps)
 9. [Testing Strategy](#testing-strategy)
-10. [Deployment Plan](#deployment-plan)
-11. [API Documentation](#api-documentation)
-12. [Performance Considerations](#performance-considerations)
-13. [Risk Management](#risk-management)
 
 ---
 
@@ -104,17 +117,17 @@ Replace the single `portfolio_state` table with a `portfolios` table that suppor
 
 ---
 
-## Database Migration Design
+## New Database Schema
 
-### Phase 1: Create New Tables
+### Core Tables
 
-#### 1.1 Create `portfolios` Table
+All tables are designed with portfolio support from the start. No migration needed - just drop and rebuild.
+
+### Portfolios Table (replaces portfolio_state)
 
 This is the central table that replaces `portfolio_state`:
 
 ```sql
--- Drop the old portfolio_state table (will be done after migration)
--- DROP TABLE portfolio_state;
 
 CREATE TABLE portfolios (
     portfolio_id SERIAL PRIMARY KEY,
@@ -138,11 +151,6 @@ CREATE TABLE portfolios (
 
     -- Strategy Configuration (flexible JSONB for strategy-specific params)
     strategy_config JSONB DEFAULT '{}'::jsonb,
-
-    -- Risk Management
-    max_position_size DECIMAL(15, 2),  -- Max $ per position
-    max_total_exposure DECIMAL(15, 2),  -- Max $ invested across all positions
-    max_positions INTEGER DEFAULT 20,  -- Max number of concurrent positions
 
     -- Performance Tracking (denormalized for fast queries)
     total_trades_executed INTEGER DEFAULT 0,
@@ -169,129 +177,145 @@ CREATE INDEX idx_portfolios_status_strategy ON portfolios(status, strategy_type)
 ```json
 {
     "min_confidence": 0.75,
-    "max_position_size": 500,
     "market_types": ["politics", "crypto"],
     "min_liquidity": 50000,
-    "min_volume": 100000,
-    "risk_per_trade": 0.02,
-    "stop_loss_percentage": 0.15,
-    "take_profit_percentage": 0.25,
-    "rebalance_threshold": 0.10
+    "min_volume": 100000
 }
 ```
 
-### Phase 2: Add `portfolio_id` Foreign Keys
-
-#### 2.1 Modify `portfolio_positions`
+### Portfolio Positions Table
 
 ```sql
--- Add portfolio_id column (nullable first for migration)
-ALTER TABLE portfolio_positions
-ADD COLUMN portfolio_id INTEGER;
+CREATE TABLE portfolio_positions (
+    id SERIAL PRIMARY KEY,
+    portfolio_id INTEGER NOT NULL,
+    trade_id VARCHAR(255) NOT NULL,
+    market_id VARCHAR(255) NOT NULL,
+    market_question TEXT,
+    action VARCHAR(50) NOT NULL,
+    amount DECIMAL(15, 2) NOT NULL,
+    entry_price DECIMAL(10, 4) NOT NULL,
+    entry_timestamp TIMESTAMP NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    current_pnl DECIMAL(15, 2) DEFAULT 0,
+    realized_pnl DECIMAL(15, 2),
+    exit_price DECIMAL(10, 4),
+    exit_timestamp TIMESTAMP,
 
--- Add foreign key constraint
-ALTER TABLE portfolio_positions
-ADD CONSTRAINT fk_portfolio_positions_portfolio
-FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
-ON DELETE CASCADE;
+    -- Foreign key constraint
+    CONSTRAINT fk_portfolio_positions_portfolio
+        FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
+        ON DELETE CASCADE
+);
 
--- Create indexes for fast filtering
-CREATE INDEX idx_portfolio_positions_portfolio_id
-ON portfolio_positions(portfolio_id);
-
-CREATE INDEX idx_portfolio_positions_portfolio_status
-ON portfolio_positions(portfolio_id, status);
-
-CREATE INDEX idx_portfolio_positions_portfolio_market
-ON portfolio_positions(portfolio_id, market_id);
-
--- After migration, make NOT NULL
--- ALTER TABLE portfolio_positions ALTER COLUMN portfolio_id SET NOT NULL;
+-- Indexes
+CREATE INDEX idx_portfolio_positions_portfolio_id ON portfolio_positions(portfolio_id);
+CREATE INDEX idx_portfolio_positions_portfolio_status ON portfolio_positions(portfolio_id, status);
+CREATE INDEX idx_portfolio_positions_portfolio_market ON portfolio_positions(portfolio_id, market_id);
 ```
 
-#### 2.2 Modify `trades`
+### Trades Table
 
 ```sql
--- Add portfolio_id column (nullable first for migration)
-ALTER TABLE trades
-ADD COLUMN portfolio_id INTEGER;
+CREATE TABLE trades (
+    id SERIAL PRIMARY KEY,
+    portfolio_id INTEGER NOT NULL,
+    trade_id VARCHAR(255) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    market_id VARCHAR(255) NOT NULL,
+    market_question TEXT,
+    action VARCHAR(50) NOT NULL,
+    amount DECIMAL(15, 2) NOT NULL,
+    entry_price DECIMAL(10, 4) NOT NULL,
+    confidence DECIMAL(5, 4),
+    reason TEXT,
+    status VARCHAR(50) NOT NULL,
+    event_id VARCHAR(255),
+    event_title TEXT,
+    event_end_date TIMESTAMP,
+    current_pnl DECIMAL(15, 2) DEFAULT 0,
+    realized_pnl DECIMAL(15, 2),
 
--- Add foreign key constraint
-ALTER TABLE trades
-ADD CONSTRAINT fk_trades_portfolio
-FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
-ON DELETE CASCADE;
+    -- Foreign key constraint
+    CONSTRAINT fk_trades_portfolio
+        FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
+        ON DELETE CASCADE
+);
 
--- Create indexes for analytics
-CREATE INDEX idx_trades_portfolio_id
-ON trades(portfolio_id);
-
-CREATE INDEX idx_trades_portfolio_timestamp
-ON trades(portfolio_id, timestamp);
-
-CREATE INDEX idx_trades_portfolio_status
-ON trades(portfolio_id, status);
-
--- After migration, make NOT NULL
--- ALTER TABLE trades ALTER COLUMN portfolio_id SET NOT NULL;
+-- Indexes
+CREATE INDEX idx_trades_portfolio_id ON trades(portfolio_id);
+CREATE INDEX idx_trades_portfolio_timestamp ON trades(portfolio_id, timestamp);
+CREATE INDEX idx_trades_portfolio_status ON trades(portfolio_id, status);
 ```
 
-#### 2.3 Modify `trading_signals`
+### Trading Signals Table
 
 ```sql
--- Add portfolio_id column (nullable for now)
-ALTER TABLE trading_signals
-ADD COLUMN portfolio_id INTEGER;
+CREATE TABLE trading_signals (
+    id SERIAL PRIMARY KEY,
+    portfolio_id INTEGER NOT NULL,
+    strategy_type VARCHAR(100) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    market_id VARCHAR(255) NOT NULL,
+    market_question TEXT,
+    action VARCHAR(50) NOT NULL,
+    target_price DECIMAL(10, 4),
+    amount DECIMAL(15, 2),
+    confidence DECIMAL(5, 4),
+    reason TEXT,
+    yes_price DECIMAL(10, 4),
+    no_price DECIMAL(10, 4),
+    market_liquidity DECIMAL(15, 2),
+    market_volume DECIMAL(15, 2),
+    event_id VARCHAR(255),
+    event_title TEXT,
+    event_end_date TIMESTAMP,
+    executed BOOLEAN DEFAULT FALSE,
+    executed_at TIMESTAMP,
+    trade_id VARCHAR(255),
 
--- Add strategy_type for tracking which strategy generated the signal
-ALTER TABLE trading_signals
-ADD COLUMN strategy_type VARCHAR(100);
+    -- Foreign key constraint
+    CONSTRAINT fk_trading_signals_portfolio
+        FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
+        ON DELETE CASCADE
+);
 
--- Add foreign key constraint
-ALTER TABLE trading_signals
-ADD CONSTRAINT fk_trading_signals_portfolio
-FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
-ON DELETE CASCADE;
-
--- Create indexes
-CREATE INDEX idx_trading_signals_portfolio
-ON trading_signals(portfolio_id);
-
-CREATE INDEX idx_trading_signals_portfolio_executed
-ON trading_signals(portfolio_id, executed);
-
-CREATE INDEX idx_trading_signals_strategy
-ON trading_signals(strategy_type);
-
--- After migration, can optionally make NOT NULL
--- ALTER TABLE trading_signals ALTER COLUMN portfolio_id SET NOT NULL;
+-- Indexes
+CREATE INDEX idx_trading_signals_portfolio ON trading_signals(portfolio_id);
+CREATE INDEX idx_trading_signals_portfolio_executed ON trading_signals(portfolio_id, executed);
+CREATE INDEX idx_trading_signals_strategy ON trading_signals(strategy_type);
 ```
 
-#### 2.4 Modify `portfolio_history`
+### Portfolio History Table
 
 ```sql
--- Add portfolio_id column
-ALTER TABLE portfolio_history
-ADD COLUMN portfolio_id INTEGER;
+CREATE TABLE portfolio_history (
+    id SERIAL PRIMARY KEY,
+    portfolio_id INTEGER NOT NULL,
+    snapshot_date DATE NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    balance DECIMAL(15, 2) NOT NULL,
+    total_invested DECIMAL(15, 2) NOT NULL,
+    total_profit_loss DECIMAL(15, 2) NOT NULL,
+    total_value DECIMAL(15, 2) NOT NULL,
+    open_positions INTEGER DEFAULT 0,
+    trade_count INTEGER DEFAULT 0,
 
--- Add foreign key constraint
-ALTER TABLE portfolio_history
-ADD CONSTRAINT fk_portfolio_history_portfolio
-FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
-ON DELETE CASCADE;
+    -- Foreign key constraint
+    CONSTRAINT fk_portfolio_history_portfolio
+        FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
+        ON DELETE CASCADE,
 
--- Create indexes for time-series queries
-CREATE INDEX idx_portfolio_history_portfolio_date
-ON portfolio_history(portfolio_id, snapshot_date);
+    -- Unique constraint to prevent duplicate snapshots
+    UNIQUE(portfolio_id, snapshot_date)
+);
 
-CREATE INDEX idx_portfolio_history_portfolio_timestamp
-ON portfolio_history(portfolio_id, timestamp);
-
--- After migration, make NOT NULL
--- ALTER TABLE portfolio_history ALTER COLUMN portfolio_id SET NOT NULL;
+-- Indexes
+CREATE INDEX idx_portfolio_history_portfolio_date ON portfolio_history(portfolio_id, snapshot_date);
+CREATE INDEX idx_portfolio_history_portfolio_timestamp ON portfolio_history(portfolio_id, timestamp);
 ```
 
-### Phase 3: Additional Supporting Tables
+### Future Enhancement Tables (Optional - Don't Implement Unless You Are Specifically Told to)
 
 #### 3.1 Create `portfolio_rebalancing_log`
 
@@ -382,8 +406,7 @@ def get_portfolio_state(portfolio_id: int = None) -> Dict:
             SELECT portfolio_id, name, description, strategy_type,
                    initial_balance, current_balance, total_invested,
                    total_profit_loss, trade_count, status, created_at,
-                   last_updated, strategy_config, max_position_size,
-                   max_total_exposure, max_positions
+                   last_updated, strategy_config
             FROM portfolios
             WHERE portfolio_id = :portfolio_id
         """), {'portfolio_id': portfolio_id}).fetchone()
@@ -404,10 +427,7 @@ def get_portfolio_state(portfolio_id: int = None) -> Dict:
             'status': result[9],
             'created_at': result[10],
             'last_updated': result[11],
-            'strategy_config': result[12] or {},
-            'max_position_size': float(result[13]) if result[13] else None,
-            'max_total_exposure': float(result[14]) if result[14] else None,
-            'max_positions': int(result[15]) if result[15] else 20
+            'strategy_config': result[12] or {}
         }
 ```
 
@@ -461,20 +481,17 @@ def create_portfolio(portfolio_data: Dict) -> int:
             'current_balance': 50000,
             'strategy_config': {
                 'min_confidence': 0.80,
-                'max_position_size': 500
-            },
-            'max_position_size': 500,
-            'max_total_exposure': 10000
+                'market_types': ['politics']
+            }
         })
     """
     with get_db() as db:
         result = db.execute(text("""
             INSERT INTO portfolios
             (name, description, strategy_type, initial_balance, current_balance,
-             strategy_config, max_position_size, max_total_exposure, max_positions, status)
+             strategy_config, status)
             VALUES (:name, :description, :strategy_type, :initial_balance, :current_balance,
-                    CAST(:strategy_config AS jsonb), :max_position_size, :max_total_exposure,
-                    :max_positions, 'active')
+                    CAST(:strategy_config AS jsonb), 'active')
             RETURNING portfolio_id
         """), {
             'name': portfolio_data['name'],
@@ -482,10 +499,7 @@ def create_portfolio(portfolio_data: Dict) -> int:
             'strategy_type': portfolio_data['strategy_type'],
             'initial_balance': portfolio_data['initial_balance'],
             'current_balance': portfolio_data.get('current_balance', portfolio_data['initial_balance']),
-            'strategy_config': json.dumps(portfolio_data.get('strategy_config', {})),
-            'max_position_size': portfolio_data.get('max_position_size'),
-            'max_total_exposure': portfolio_data.get('max_total_exposure'),
-            'max_positions': portfolio_data.get('max_positions', 20)
+            'strategy_config': json.dumps(portfolio_data.get('strategy_config', {}))
         })
         portfolio_id = result.scalar_one()
         db.commit()
@@ -878,31 +892,13 @@ def get_current_signals(portfolio_id: int = None, executed: bool = False) -> Lis
 
 ## Controller Architecture Changes
 
-### Strategy Controller Architecture Decision
+### Strategy Controller Architecture
 
-**Decision Point**: Do we use one strategy controller with portfolio context, or multiple strategy controllers?
+**Selected Approach**: Multiple Strategy Controllers (Option B)
 
-#### Option A: Single Strategy Controller with Portfolio Context (Simpler)
+We'll use separate strategy controllers for each trading strategy, allowing true separation of concerns and independent scaling.
 
-**Port 8002**: Strategy Controller
-
-- Accepts `portfolio_id` parameter in all endpoints
-- Loads strategy config from `portfolios.strategy_config` JSONB field
-- Generates signals based on portfolio's strategy type
-- Single codebase, easier to maintain
-
-**Pros:**
-- Simpler deployment (one process)
-- Easier to maintain
-- All strategies in one codebase
-- Shared logic and utilities
-
-**Cons:**
-- All strategies in one file (can get large)
-- Cannot independently restart strategies
-- Less flexibility for different dependencies per strategy
-
-#### Option B: Multiple Strategy Controllers (More Scalable)
+#### Controller Architecture
 
 **Port 8002**: Momentum Strategy Controller
 **Port 8005**: Mean Reversion Strategy Controller
@@ -910,23 +906,54 @@ def get_current_signals(portfolio_id: int = None, executed: bool = False) -> Lis
 **Port 8007**: Hybrid Strategy Controller
 
 Each controller:
-- Accepts `portfolio_id` parameter
+- Accepts `portfolio_id` parameter in all endpoints
 - Implements specific strategy logic
-- Can have different dependencies
+- Can have different dependencies and configurations
 - Can be scaled independently
+- Runs in parallel with other strategy controllers
+
+#### Benefits of This Approach
 
 **Pros:**
-- True separation of concerns
-- Independent scaling and deployment
-- Can run in parallel
-- Different dependencies per strategy
+- True separation of concerns - each strategy is completely independent
+- Independent scaling and deployment - scale only the strategies you need
+- Can run in parallel - multiple strategies can analyze markets simultaneously
+- Different dependencies per strategy - no conflicts between strategy requirements
+- Easier to add new strategies - just deploy a new controller
+- Better fault isolation - if one strategy crashes, others continue running
 
 **Cons:**
-- More complex deployment
-- Need to manage multiple processes
-- More configuration
+- More complex deployment - need to manage multiple processes
+- More configuration - each controller needs its own config
+- More resource usage - multiple processes instead of one
 
-**Recommendation**: Start with Option A (single controller), migrate to Option B as needed.
+#### How Portfolios Map to Strategy Controllers
+
+Each portfolio has a `strategy_type` field (e.g., "momentum", "mean_reversion", "arbitrage", "hybrid").
+
+When the trading controller runs a portfolio cycle, it calls the appropriate strategy controller based on the portfolio's `strategy_type`:
+
+```python
+# In trading_controller.py
+def get_strategy_controller_url(strategy_type: str) -> str:
+    """Map strategy type to controller URL"""
+    strategy_ports = {
+        'momentum': 8002,
+        'mean_reversion': 8005,
+        'arbitrage': 8006,
+        'hybrid': 8007
+    }
+    port = strategy_ports.get(strategy_type, 8002)
+    return f"http://localhost:{port}"
+
+# When running portfolio cycle
+strategy_url = get_strategy_controller_url(portfolio['strategy_type'])
+response = requests.post(f"{strategy_url}/generate-signals", json={
+    'portfolio_id': portfolio['portfolio_id']
+})
+```
+
+This way, each portfolio automatically uses the correct strategy controller based on its configuration.
 
 ### Paper Trading Controller Changes
 
@@ -994,26 +1021,6 @@ async def execute_signals(portfolio_id: Optional[int] = None):
                         failed_trades.append({
                             'signal_id': signal['id'],
                             'reason': f"Insufficient balance: ${portfolio['current_balance']:.2f} < ${trade_amount}"
-                        })
-                        continue
-
-                    # Check if portfolio would exceed max exposure
-                    if portfolio.get('max_total_exposure'):
-                        new_exposure = portfolio['total_invested'] + trade_amount
-                        if new_exposure > portfolio['max_total_exposure']:
-                            logger.warning(f"Portfolio {pid}: Would exceed max exposure")
-                            failed_trades.append({
-                                'signal_id': signal['id'],
-                                'reason': f"Would exceed max exposure: ${new_exposure} > ${portfolio['max_total_exposure']}"
-                            })
-                            continue
-
-                    # Check position size limit
-                    if portfolio.get('max_position_size') and trade_amount > portfolio['max_position_size']:
-                        logger.warning(f"Portfolio {pid}: Trade exceeds max position size")
-                        failed_trades.append({
-                            'signal_id': signal['id'],
-                            'reason': f"Exceeds max position size: ${trade_amount} > ${portfolio['max_position_size']}"
                         })
                         continue
 
@@ -1757,423 +1764,83 @@ def create_daily_portfolio_snapshot(portfolio_data: Dict, portfolio_id: int):
 
 ---
 
-## Migration Script Implementation
+## Implementation Steps
 
-**Recommended Approach**: Use the manual Python migration script below to migrate your database schema.
+Since we're doing a clean rebuild, the process is straightforward:
 
-**After migration is complete**, you can optionally set up SQLAlchemy + Alembic for cleaner database operations and future migrations. See **[SQLALCHEMY_ALEMBIC_SETUP.md](SQLALCHEMY_ALEMBIC_SETUP.md)** for the complete guide.
+### Step 1: Save Current State (Git)
 
-### Why Manual Migration First?
+```bash
+# Commit any current changes
+git add .
+git commit -m "Save state before portfolio architecture migration"
+```
 
-1. **Faster**: Get the multi-portfolio system working quickly
-2. **Less Duplication**: Don't write SQLAlchemy models twice (old + new schema)
-3. **Lower Risk**: Separate the risky migration from the code refactor
-4. **Progressive**: Migrate → Test → Then improve code quality with SQLAlchemy
+### Step 2: Create New Schema File
 
----
+Create a new SQL file `src/db/schema_v2_portfolios.sql` with all the table definitions from the "New Database Schema" section above.
 
-## Manual Python Migration Script
+### Step 3: Drop and Recreate Database
 
-Complete migration script to move from single to multiple portfolios:
+```bash
+# Drop existing database (local only!)
+psql -U postgres -c "DROP DATABASE prescient_trading_db;"
+
+# Create fresh database
+psql -U postgres -c "CREATE DATABASE prescient_trading_db;"
+
+# Apply new schema
+psql -U postgres -d prescient_trading_db -f src/db/schema_v2_portfolios.sql
+```
+
+### Step 4: Create Initial Portfolio
 
 ```python
-# scripts/migrate_to_multiple_portfolios.py
-
-"""
-Migration script to convert single portfolio system to multiple portfolio system
-
-This script:
-1. Creates the new portfolios table
-2. Migrates existing portfolio_state data to a "Default Portfolio"
-3. Updates all existing records with the default portfolio_id
-4. Adds foreign key constraints
-5. Drops the old portfolio_state table
-
-IMPORTANT: Backup your database before running this script!
-"""
-
-import os
-import sys
-import logging
-from datetime import datetime
-
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from sqlalchemy import text
-from src.db.connection import get_db
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-def backup_database():
-    """Create a database backup before migration"""
-    logger.info("Creating database backup...")
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_file = f"backup_before_portfolio_migration_{timestamp}.sql"
-
-    # PostgreSQL backup command
-    db_name = os.getenv('POSTGRES_DB', 'prescient_trading_db')
-    os.system(f"pg_dump {db_name} > {backup_file}")
-
-    logger.info(f"Backup created: {backup_file}")
-    return backup_file
-
-
-def create_portfolios_table():
-    """Step 1: Create the new portfolios table"""
-    logger.info("Step 1: Creating portfolios table...")
-
-    with get_db() as db:
-        db.execute(text("""
-            CREATE TABLE IF NOT EXISTS portfolios (
-                portfolio_id SERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                description TEXT,
-                strategy_type VARCHAR(100) NOT NULL,
-                initial_balance DECIMAL(15, 2) NOT NULL,
-                current_balance DECIMAL(15, 2) NOT NULL,
-                total_invested DECIMAL(15, 2) DEFAULT 0,
-                total_profit_loss DECIMAL(15, 2) DEFAULT 0,
-                trade_count INTEGER DEFAULT 0,
-                status VARCHAR(50) DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT NOW(),
-                last_updated TIMESTAMP DEFAULT NOW(),
-                strategy_config JSONB DEFAULT '{}'::jsonb,
-                max_position_size DECIMAL(15, 2),
-                max_total_exposure DECIMAL(15, 2),
-                max_positions INTEGER DEFAULT 20,
-                total_trades_executed INTEGER DEFAULT 0,
-                total_winning_trades INTEGER DEFAULT 0,
-                total_losing_trades INTEGER DEFAULT 0,
-                avg_trade_pnl DECIMAL(15, 2) DEFAULT 0,
-                max_drawdown DECIMAL(15, 2) DEFAULT 0,
-                last_trade_at TIMESTAMP,
-                last_price_update TIMESTAMP,
-                UNIQUE(name)
-            )
-        """))
-        db.commit()
-
-    logger.info("✓ Portfolios table created")
-
-
-def create_indexes():
-    """Step 2: Create indexes on portfolios table"""
-    logger.info("Step 2: Creating indexes...")
-
-    with get_db() as db:
-        db.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_portfolios_status
-            ON portfolios(status)
-        """))
-        db.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_portfolios_strategy_type
-            ON portfolios(strategy_type)
-        """))
-        db.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_portfolios_status_strategy
-            ON portfolios(status, strategy_type)
-        """))
-        db.commit()
-
-    logger.info("✓ Indexes created")
-
-
-def migrate_portfolio_state():
-    """Step 3: Migrate existing portfolio_state to portfolios table"""
-    logger.info("Step 3: Migrating portfolio_state data...")
-
-    with get_db() as db:
-        # Get current portfolio state
-        result = db.execute(text("""
-            SELECT balance, total_invested, total_profit_loss, trade_count, created_at
-            FROM portfolio_state
-            WHERE id = 1
-        """)).fetchone()
-
-        if not result:
-            logger.warning("No portfolio_state found, creating default portfolio")
-            balance = 10000.0
-            total_invested = 0.0
-            total_profit_loss = 0.0
-            trade_count = 0
-            created_at = datetime.now()
-        else:
-            balance = float(result[0])
-            total_invested = float(result[1])
-            total_profit_loss = float(result[2])
-            trade_count = int(result[3])
-            created_at = result[4]
-
-        # Insert as "Default Portfolio"
-        result = db.execute(text("""
-            INSERT INTO portfolios
-            (name, description, strategy_type, initial_balance, current_balance,
-             total_invested, total_profit_loss, trade_count, status, created_at)
-            VALUES ('Default Portfolio', 'Migrated from single portfolio system',
-                    'momentum', 10000.00, :balance, :total_invested, :total_profit_loss,
-                    :trade_count, 'active', :created_at)
-            RETURNING portfolio_id
-        """), {
-            'balance': balance,
-            'total_invested': total_invested,
-            'total_profit_loss': total_profit_loss,
-            'trade_count': trade_count,
-            'created_at': created_at
-        })
-
-        default_portfolio_id = result.scalar_one()
-        db.commit()
-
-        logger.info(f"✓ Default portfolio created with id={default_portfolio_id}")
-        logger.info(f"   Balance: ${balance:.2f}")
-        logger.info(f"   Total Invested: ${total_invested:.2f}")
-        logger.info(f"   Total P&L: ${total_profit_loss:.2f}")
-        logger.info(f"   Trade Count: {trade_count}")
-
-        return int(default_portfolio_id)
-
-
-def add_portfolio_id_columns():
-    """Step 4: Add portfolio_id columns to existing tables"""
-    logger.info("Step 4: Adding portfolio_id columns...")
-
-    tables = [
-        'portfolio_positions',
-        'trades',
-        'trading_signals',
-        'portfolio_history'
-    ]
-
-    with get_db() as db:
-        for table in tables:
-            logger.info(f"   Adding portfolio_id to {table}...")
-            db.execute(text(f"""
-                ALTER TABLE {table}
-                ADD COLUMN IF NOT EXISTS portfolio_id INTEGER
-            """))
-
-        # Add strategy_type to trading_signals
-        logger.info("   Adding strategy_type to trading_signals...")
-        db.execute(text("""
-            ALTER TABLE trading_signals
-            ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(100)
-        """))
-
-        db.commit()
-
-    logger.info("✓ Columns added")
-
-
-def update_existing_records(default_portfolio_id: int):
-    """Step 5: Update all existing records with default portfolio_id"""
-    logger.info(f"Step 5: Updating existing records with portfolio_id={default_portfolio_id}...")
-
-    tables = [
-        'portfolio_positions',
-        'trades',
-        'trading_signals',
-        'portfolio_history'
-    ]
-
-    with get_db() as db:
-        for table in tables:
-            logger.info(f"   Updating {table}...")
-            result = db.execute(text(f"""
-                UPDATE {table}
-                SET portfolio_id = :portfolio_id
-                WHERE portfolio_id IS NULL
-            """), {'portfolio_id': default_portfolio_id})
-
-            updated_count = result.rowcount
-            logger.info(f"   ✓ Updated {updated_count} rows in {table}")
-
-        db.commit()
-
-    logger.info("✓ All records updated")
-
-
-def add_foreign_keys():
-    """Step 6: Add foreign key constraints"""
-    logger.info("Step 6: Adding foreign key constraints...")
-
-    constraints = [
-        ('portfolio_positions', 'fk_portfolio_positions_portfolio'),
-        ('trades', 'fk_trades_portfolio'),
-        ('trading_signals', 'fk_trading_signals_portfolio'),
-        ('portfolio_history', 'fk_portfolio_history_portfolio')
-    ]
-
-    with get_db() as db:
-        for table, constraint_name in constraints:
-            logger.info(f"   Adding FK to {table}...")
-            db.execute(text(f"""
-                ALTER TABLE {table}
-                ADD CONSTRAINT {constraint_name}
-                FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
-                ON DELETE CASCADE
-            """))
-
-        db.commit()
-
-    logger.info("✓ Foreign keys added")
-
-
-def add_table_indexes():
-    """Step 7: Add indexes on portfolio_id columns"""
-    logger.info("Step 7: Adding indexes on portfolio_id columns...")
-
-    indexes = [
-        ("portfolio_positions", "idx_portfolio_positions_portfolio_id", "portfolio_id"),
-        ("portfolio_positions", "idx_portfolio_positions_portfolio_status", "portfolio_id, status"),
-        ("portfolio_positions", "idx_portfolio_positions_portfolio_market", "portfolio_id, market_id"),
-        ("trades", "idx_trades_portfolio_id", "portfolio_id"),
-        ("trades", "idx_trades_portfolio_timestamp", "portfolio_id, timestamp"),
-        ("trades", "idx_trades_portfolio_status", "portfolio_id, status"),
-        ("trading_signals", "idx_trading_signals_portfolio", "portfolio_id"),
-        ("trading_signals", "idx_trading_signals_portfolio_executed", "portfolio_id, executed"),
-        ("trading_signals", "idx_trading_signals_strategy", "strategy_type"),
-        ("portfolio_history", "idx_portfolio_history_portfolio_date", "portfolio_id, snapshot_date"),
-        ("portfolio_history", "idx_portfolio_history_portfolio_timestamp", "portfolio_id, timestamp")
-    ]
-
-    with get_db() as db:
-        for table, index_name, columns in indexes:
-            logger.info(f"   Creating {index_name}...")
-            db.execute(text(f"""
-                CREATE INDEX IF NOT EXISTS {index_name}
-                ON {table}({columns})
-            """))
-
-        db.commit()
-
-    logger.info("✓ Indexes created")
-
-
-def make_portfolio_id_not_null():
-    """Step 8: Make portfolio_id NOT NULL (optional - can be done later)"""
-    logger.info("Step 8: Making portfolio_id NOT NULL...")
-
-    tables = [
-        'portfolio_positions',
-        'trades',
-        'portfolio_history'
-    ]
-
-    with get_db() as db:
-        for table in tables:
-            logger.info(f"   Updating {table}...")
-            db.execute(text(f"""
-                ALTER TABLE {table}
-                ALTER COLUMN portfolio_id SET NOT NULL
-            """))
-
-        db.commit()
-
-    logger.info("✓ Columns set to NOT NULL")
-
-
-def drop_portfolio_state_table():
-    """Step 9: Drop the old portfolio_state table"""
-    logger.info("Step 9: Dropping portfolio_state table...")
-
-    with get_db() as db:
-        db.execute(text("DROP TABLE IF EXISTS portfolio_state"))
-        db.commit()
-
-    logger.info("✓ portfolio_state table dropped")
-
-
-def verify_migration(default_portfolio_id: int):
-    """Step 10: Verify migration was successful"""
-    logger.info("Step 10: Verifying migration...")
-
-    with get_db() as db:
-        # Check portfolios table
-        result = db.execute(text("""
-            SELECT COUNT(*) FROM portfolios
-        """)).scalar()
-        logger.info(f"   Portfolios count: {result}")
-
-        # Check each table has portfolio_id
-        tables = ['portfolio_positions', 'trades', 'trading_signals', 'portfolio_history']
-        for table in tables:
-            result = db.execute(text(f"""
-                SELECT COUNT(*) FROM {table} WHERE portfolio_id = :portfolio_id
-            """), {'portfolio_id': default_portfolio_id}).scalar()
-            logger.info(f"   {table} rows with portfolio_id={default_portfolio_id}: {result}")
-
-        # Check no NULL portfolio_ids
-        for table in ['portfolio_positions', 'trades', 'portfolio_history']:
-            result = db.execute(text(f"""
-                SELECT COUNT(*) FROM {table} WHERE portfolio_id IS NULL
-            """)).scalar()
-            if result > 0:
-                logger.warning(f"   WARNING: {table} has {result} NULL portfolio_ids")
-            else:
-                logger.info(f"   ✓ {table} has no NULL portfolio_ids")
-
-    logger.info("✓ Migration verification complete")
-
-
-def main():
-    """Run the complete migration"""
-    logger.info("=" * 60)
-    logger.info("PRESCIENT OS: MULTIPLE PORTFOLIO MIGRATION")
-    logger.info("=" * 60)
-
-    # Confirm with user
-    print("\n⚠️  WARNING: This migration will make significant database changes")
-    print("   Make sure you have backed up your database!")
-    response = input("\nProceed with migration? (yes/no): ")
-
-    if response.lower() != 'yes':
-        logger.info("Migration cancelled by user")
-        return
-
-    try:
-        # Create backup
-        backup_file = backup_database()
-
-        # Run migration steps
-        create_portfolios_table()
-        create_indexes()
-        default_portfolio_id = migrate_portfolio_state()
-        add_portfolio_id_columns()
-        update_existing_records(default_portfolio_id)
-        add_foreign_keys()
-        add_table_indexes()
-        make_portfolio_id_not_null()
-        drop_portfolio_state_table()
-        verify_migration(default_portfolio_id)
-
-        logger.info("=" * 60)
-        logger.info("✅ MIGRATION COMPLETED SUCCESSFULLY")
-        logger.info("=" * 60)
-        logger.info(f"Default Portfolio ID: {default_portfolio_id}")
-        logger.info(f"Backup File: {backup_file}")
-        logger.info("\nNext steps:")
-        logger.info("1. Test the system with the default portfolio")
-        logger.info("2. Create additional portfolios using the new API endpoints")
-        logger.info("3. Update your controllers to use portfolio_id parameters")
-
-    except Exception as e:
-        logger.error("=" * 60)
-        logger.error("❌ MIGRATION FAILED")
-        logger.error("=" * 60)
-        logger.error(f"Error: {e}")
-        logger.error("\nRestore from backup:")
-        logger.error(f"   psql {os.getenv('POSTGRES_DB', 'prescient_trading_db')} < {backup_file}")
-        raise
-
-
-if __name__ == "__main__":
-    main()
+# Run this once to create your first portfolio
+from src.db.operations import create_portfolio
+
+portfolio_id = create_portfolio({
+    'name': 'Default Portfolio',
+    'description': 'Primary trading portfolio',
+    'strategy_type': 'momentum',
+    'initial_balance': 10000,
+    'current_balance': 10000,
+    'strategy_config': {
+        'min_confidence': 0.75,
+        'market_types': ['politics', 'crypto']
+    }
+})
+```
+
+### Step 5: Update Code
+
+Update all the database operation functions as documented in the sections below.
+
+### Step 6: Test
+
+Run through a complete trading cycle to verify everything works.
+
+### Step 7: Commit
+
+```bash
+git add .
+git commit -m "BREAKING: Migrate to portfolio-centric architecture with multiple portfolio support
+
+- Replace portfolio_state table with portfolios table
+- Add portfolio_id foreign keys to all related tables
+- Update all database operations to support portfolio context
+- Update controllers to handle portfolio-specific cycles
+- Old schema preserved in git history"
 ```
 
 ---
+
+## Detailed Code Changes
+
+The sections below provide the detailed code changes needed for each component.
+
+---
+
 
 ## Testing Strategy
 
@@ -2517,10 +2184,8 @@ Content-Type: application/json
     "initial_balance": 50000.00,
     "strategy_config": {
         "min_confidence": 0.80,
-        "max_position_size": 1000
-    },
-    "max_position_size": 1000,
-    "max_total_exposure": 20000
+        "market_types": ["crypto", "politics"]
+    }
 }
 
 Response:
@@ -2591,7 +2256,9 @@ Content-Type: application/json
 
 {
     "status": "paused",
-    "max_total_exposure": 15000
+    "strategy_config": {
+        "min_confidence": 0.85
+    }
 }
 
 Response:
@@ -2665,36 +2332,9 @@ Key metrics to monitor:
 
 ## Risk Management
 
-### Cross-Portfolio Risks
-
-1. **Market Position Limits**: Implement global market position tracking
-   ```python
-   def check_global_market_exposure(market_id: str) -> Dict:
-       """Check total exposure across all portfolios for a market"""
-       with get_db() as db:
-           result = db.execute(text("""
-               SELECT COUNT(*), SUM(amount)
-               FROM portfolio_positions
-               WHERE market_id = :market_id AND status = 'open'
-           """), {'market_id': market_id}).fetchone()
-
-           return {
-               'total_positions': result[0],
-               'total_amount': float(result[1]) if result[1] else 0
-           }
-   ```
-
-2. **API Rate Limiting**: Track API calls across all portfolios
-3. **Capital Limits**: Ensure total capital doesn't exceed available funds
-
-### Portfolio-Level Risk Management
-
-Each portfolio enforces:
-- `max_position_size`: Maximum $ per position
-- `max_total_exposure`: Maximum total $ invested
-- `max_positions`: Maximum number of open positions
-
 ### Emergency Controls
+
+Basic controls for pausing and reactivating portfolios when needed:
 
 ```python
 def pause_all_portfolios(reason: str):
@@ -2714,24 +2354,614 @@ def reactivate_portfolio(portfolio_id: int):
     update_portfolio(portfolio_id, {'status': 'active'})
 ```
 
+**Note**: Position sizing and risk management logic should be implemented within each strategy's trading logic, not at the database level.
+
+---
+
+## Step 9: Trading Controller Refactoring
+
+After completing the database migration and controller updates, the final step is refactoring the trading controller architecture to support portfolio-specific trading strategies.
+
+### Architecture Overview
+
+**Current Problem**: The trading controller (`trading_controller.py`) contains strategy-specific logic that doesn't scale to multiple different strategies.
+
+**Solution**: Split responsibilities:
+- **Strategy Controllers** (Ports 8002, 8005, 8006, 8007): Contains strategy-specific trading cycle logic
+- **Trading Controller** (Port 8004): Thin orchestration layer that routes portfolios to their strategy controllers
+
+### Strategy-Specific Controllers
+
+Each strategy controller implements its own `/strategy/run-full-cycle` endpoint with custom logic:
+
+#### Momentum Strategy Controller (Port 8002)
+
+```python
+# momentum_strategy_controller.py
+from fastapi import FastAPI, HTTPException
+from src.db.operations import get_portfolio_state, get_all_markets
+import logging
+
+app = FastAPI()
+logger = logging.getLogger(__name__)
+
+@app.post("/strategy/run-full-cycle")
+async def run_full_cycle(portfolio_id: int):
+    """
+    Complete trading cycle for momentum strategy.
+
+    Flow:
+    1. Fetch portfolio config
+    2. Get ALL markets from shared pool
+    3. Apply portfolio-specific filters
+    4. Calculate momentum scores
+    5. Generate signals based on momentum thresholds
+    """
+    try:
+        # Load portfolio and strategy config
+        portfolio = get_portfolio_state(portfolio_id)
+        config = portfolio['strategy_config']
+
+        # Fetch ALL markets from shared database
+        markets = get_all_markets()
+
+        # Apply portfolio-specific filters from config
+        filtered_markets = filter_markets(
+            markets,
+            min_liquidity=config.get('min_liquidity', 1000),
+            min_volume=config.get('min_volume', 500),
+            categories=config.get('categories', [])
+        )
+
+        # MOMENTUM-SPECIFIC LOGIC
+        for market in filtered_markets:
+            # Calculate momentum indicators
+            market['momentum_score'] = calculate_momentum(market)
+            market['price_velocity'] = calculate_price_velocity(market)
+            market['volume_acceleration'] = calculate_volume_acceleration(market)
+
+        # Generate signals based on momentum thresholds
+        signals = generate_momentum_signals(
+            filtered_markets,
+            portfolio,
+            momentum_threshold=config.get('momentum_threshold', 0.7),
+            velocity_threshold=config.get('velocity_threshold', 0.05)
+        )
+
+        logger.info(f"Portfolio {portfolio_id}: Generated {len(signals)} momentum signals")
+
+        return {
+            "status": "success",
+            "portfolio_id": portfolio_id,
+            "strategy": "momentum",
+            "signals_generated": len(signals),
+            "markets_analyzed": len(filtered_markets)
+        }
+
+    except Exception as e:
+        logger.error(f"Error in momentum strategy cycle: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def calculate_momentum(market: dict) -> float:
+    """Calculate momentum score for a market"""
+    # Get recent price snapshots
+    snapshots = get_market_snapshots(market['market_id'], hours=24)
+
+    if len(snapshots) < 10:
+        return 0.0
+
+    # Calculate price change rate
+    price_changes = []
+    for i in range(1, len(snapshots)):
+        change = (snapshots[i]['yes_price'] - snapshots[i-1]['yes_price']) / snapshots[i-1]['yes_price']
+        price_changes.append(change)
+
+    # Momentum = average price change * consistency
+    avg_change = sum(price_changes) / len(price_changes)
+    consistency = len([c for c in price_changes if c > 0]) / len(price_changes)
+
+    return avg_change * consistency
+
+
+def generate_momentum_signals(markets: list, portfolio: dict,
+                              momentum_threshold: float,
+                              velocity_threshold: float) -> list:
+    """Generate BUY signals for markets with strong momentum"""
+    signals = []
+
+    for market in markets:
+        if market['momentum_score'] > momentum_threshold and \
+           market['price_velocity'] > velocity_threshold:
+
+            signal = {
+                'portfolio_id': portfolio['portfolio_id'],
+                'market_id': market['market_id'],
+                'action': 'BUY',
+                'target_price': market['yes_price'],
+                'confidence': market['momentum_score'],
+                'reasoning': f"Strong momentum: {market['momentum_score']:.2f}, velocity: {market['price_velocity']:.4f}"
+            }
+
+            # Store signal in database
+            create_trading_signal(signal)
+            signals.append(signal)
+
+    return signals
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8002)
+```
+
+#### Mean Reversion Strategy Controller (Port 8005)
+
+```python
+# mean_reversion_strategy_controller.py
+from fastapi import FastAPI, HTTPException
+import logging
+
+app = FastAPI()
+logger = logging.getLogger(__name__)
+
+@app.post("/strategy/run-full-cycle")
+async def run_full_cycle(portfolio_id: int):
+    """
+    Complete trading cycle for mean reversion strategy.
+
+    Flow:
+    1. Fetch portfolio config
+    2. Get ALL markets from shared pool
+    3. Apply portfolio-specific filters
+    4. Calculate deviation from mean prices
+    5. Generate signals for oversold/overbought markets
+    """
+    try:
+        portfolio = get_portfolio_state(portfolio_id)
+        config = portfolio['strategy_config']
+
+        markets = get_all_markets()
+        filtered_markets = filter_markets(
+            markets,
+            min_liquidity=config.get('min_liquidity', 2000),
+            min_volume=config.get('min_volume', 1000)
+        )
+
+        # MEAN REVERSION-SPECIFIC LOGIC
+        for market in filtered_markets:
+            # Calculate statistical measures
+            market['mean_price'] = calculate_mean_price(market)
+            market['std_dev'] = calculate_std_dev(market)
+            market['z_score'] = calculate_z_score(market)
+
+        # Generate signals for extreme deviations
+        signals = generate_mean_reversion_signals(
+            filtered_markets,
+            portfolio,
+            z_score_threshold=config.get('z_score_threshold', 2.0)
+        )
+
+        logger.info(f"Portfolio {portfolio_id}: Generated {len(signals)} mean reversion signals")
+
+        return {
+            "status": "success",
+            "portfolio_id": portfolio_id,
+            "strategy": "mean_reversion",
+            "signals_generated": len(signals),
+            "markets_analyzed": len(filtered_markets)
+        }
+
+    except Exception as e:
+        logger.error(f"Error in mean reversion strategy cycle: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def calculate_z_score(market: dict) -> float:
+    """Calculate how many standard deviations current price is from mean"""
+    snapshots = get_market_snapshots(market['market_id'], days=7)
+
+    if len(snapshots) < 20:
+        return 0.0
+
+    prices = [s['yes_price'] for s in snapshots]
+    mean = sum(prices) / len(prices)
+    variance = sum((p - mean) ** 2 for p in prices) / len(prices)
+    std_dev = variance ** 0.5
+
+    if std_dev == 0:
+        return 0.0
+
+    current_price = market['yes_price']
+    return (current_price - mean) / std_dev
+
+
+def generate_mean_reversion_signals(markets: list, portfolio: dict,
+                                    z_score_threshold: float) -> list:
+    """Generate signals for oversold (buy) or overbought (sell) markets"""
+    signals = []
+
+    for market in markets:
+        z_score = market['z_score']
+
+        # Oversold - price is abnormally low, expect reversion up
+        if z_score < -z_score_threshold:
+            signal = {
+                'portfolio_id': portfolio['portfolio_id'],
+                'market_id': market['market_id'],
+                'action': 'BUY',
+                'target_price': market['yes_price'],
+                'confidence': min(abs(z_score) / 3.0, 0.95),
+                'reasoning': f"Oversold: z-score {z_score:.2f}, mean: {market['mean_price']:.4f}"
+            }
+            create_trading_signal(signal)
+            signals.append(signal)
+
+        # Overbought - price is abnormally high, expect reversion down
+        elif z_score > z_score_threshold:
+            signal = {
+                'portfolio_id': portfolio['portfolio_id'],
+                'market_id': market['market_id'],
+                'action': 'SELL',
+                'target_price': market['no_price'],
+                'confidence': min(abs(z_score) / 3.0, 0.95),
+                'reasoning': f"Overbought: z-score {z_score:.2f}, mean: {market['mean_price']:.4f}"
+            }
+            create_trading_signal(signal)
+            signals.append(signal)
+
+    return signals
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8005)
+```
+
+### Trading Controller as Orchestration Layer
+
+The trading controller becomes a thin layer that coordinates the process without knowing strategy details:
+
+```python
+# trading_controller.py (REFACTORED)
+from fastapi import FastAPI, HTTPException
+import requests
+import logging
+from src.db.operations import (
+    get_all_active_portfolios,
+    get_portfolio_state,
+    create_portfolio_snapshot
+)
+
+app = FastAPI()
+logger = logging.getLogger(__name__)
+
+# Strategy controller port mapping
+STRATEGY_CONTROLLERS = {
+    'momentum': 'http://localhost:8002',
+    'mean_reversion': 'http://localhost:8005',
+    'arbitrage': 'http://localhost:8006',
+    'hybrid': 'http://localhost:8007'
+}
+
+
+def get_strategy_controller_url(strategy_type: str) -> str:
+    """Get the URL for a strategy controller"""
+    url = STRATEGY_CONTROLLERS.get(strategy_type)
+    if not url:
+        raise ValueError(f"Unknown strategy type: {strategy_type}")
+    return url
+
+
+@app.post("/trading/run-portfolio-cycle")
+async def run_portfolio_cycle(portfolio_id: int):
+    """
+    Orchestrate a complete trading cycle for a single portfolio.
+
+    Flow:
+    1. Ensure shared data is collected (events/markets)
+    2. Load portfolio and determine strategy type
+    3. Route to appropriate strategy controller
+    4. Execute generated signals
+    5. Update portfolio state
+    6. Create portfolio snapshot
+
+    This endpoint does NOT contain strategy-specific logic.
+    """
+    try:
+        logger.info(f"Starting trading cycle for portfolio {portfolio_id}")
+
+        # Step 1: Ensure shared data is up-to-date
+        await ensure_shared_data_collected()
+
+        # Step 2: Load portfolio and get strategy type
+        portfolio = get_portfolio_state(portfolio_id)
+
+        if portfolio['status'] != 'active':
+            logger.warning(f"Portfolio {portfolio_id} is not active, skipping")
+            return {"status": "skipped", "reason": "portfolio not active"}
+
+        strategy_type = portfolio['strategy_type']
+        strategy_url = get_strategy_controller_url(strategy_type)
+
+        logger.info(f"Portfolio {portfolio_id} using {strategy_type} strategy at {strategy_url}")
+
+        # Step 3: Call strategy-specific controller
+        response = requests.post(
+            f"{strategy_url}/strategy/run-full-cycle",
+            json={"portfolio_id": portfolio_id},
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            logger.error(f"Strategy controller error: {response.text}")
+            raise HTTPException(status_code=500, detail="Strategy controller failed")
+
+        strategy_result = response.json()
+        logger.info(f"Strategy generated {strategy_result.get('signals_generated', 0)} signals")
+
+        # Step 4: Execute signals via paper trading controller
+        execution_response = requests.get(
+            f"http://localhost:8003/paper-trading/execute-signals",
+            params={"portfolio_id": portfolio_id},
+            timeout=30
+        )
+
+        if execution_response.status_code != 200:
+            logger.error(f"Signal execution error: {execution_response.text}")
+            raise HTTPException(status_code=500, detail="Signal execution failed")
+
+        execution_result = execution_response.json()
+        logger.info(f"Executed {execution_result.get('executed', 0)} signals")
+
+        # Step 5: Get updated portfolio state
+        updated_portfolio = get_portfolio_state(portfolio_id)
+
+        # Step 6: Create portfolio snapshot
+        create_portfolio_snapshot(updated_portfolio)
+
+        return {
+            "status": "success",
+            "portfolio_id": portfolio_id,
+            "strategy": strategy_type,
+            "signals_generated": strategy_result.get('signals_generated', 0),
+            "signals_executed": execution_result.get('executed', 0),
+            "current_balance": updated_portfolio['current_balance'],
+            "total_profit_loss": updated_portfolio['total_profit_loss']
+        }
+
+    except Exception as e:
+        logger.error(f"Error in portfolio cycle: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/trading/run-all-portfolios")
+async def run_all_portfolios():
+    """
+    Run trading cycles for ALL active portfolios.
+
+    This is the main entry point for the scheduled trading cycle.
+    """
+    try:
+        logger.info("Starting trading cycle for all portfolios")
+
+        # Collect shared data ONCE for all portfolios
+        await ensure_shared_data_collected()
+
+        # Get all active portfolios
+        portfolios = get_all_active_portfolios()
+        logger.info(f"Found {len(portfolios)} active portfolios")
+
+        results = []
+
+        # Run cycle for each portfolio
+        for portfolio in portfolios:
+            try:
+                result = await run_portfolio_cycle(portfolio['portfolio_id'])
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error processing portfolio {portfolio['portfolio_id']}: {e}")
+                results.append({
+                    "status": "error",
+                    "portfolio_id": portfolio['portfolio_id'],
+                    "error": str(e)
+                })
+
+        # Summary
+        successful = len([r for r in results if r['status'] == 'success'])
+        failed = len([r for r in results if r['status'] == 'error'])
+
+        logger.info(f"Trading cycle complete: {successful} successful, {failed} failed")
+
+        return {
+            "status": "complete",
+            "total_portfolios": len(portfolios),
+            "successful": successful,
+            "failed": failed,
+            "results": results
+        }
+
+    except Exception as e:
+        logger.error(f"Error in run_all_portfolios: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def ensure_shared_data_collected():
+    """
+    Ensure events and markets are collected and up-to-date.
+    This is called ONCE before processing portfolios.
+    """
+    try:
+        # Call events controller
+        events_response = requests.get(
+            "http://localhost:8000/events/collect",
+            timeout=60
+        )
+
+        if events_response.status_code != 200:
+            logger.error(f"Events collection failed: {events_response.text}")
+            raise Exception("Events collection failed")
+
+        # Call markets controller
+        markets_response = requests.get(
+            "http://localhost:8001/markets/collect",
+            timeout=60
+        )
+
+        if markets_response.status_code != 200:
+            logger.error(f"Markets collection failed: {markets_response.text}")
+            raise Exception("Markets collection failed")
+
+        logger.info("Shared data collection complete")
+
+    except Exception as e:
+        logger.error(f"Error collecting shared data: {e}")
+        raise
+
+
+@app.get("/trading/portfolio-status/{portfolio_id}")
+async def get_portfolio_status(portfolio_id: int):
+    """Get current status of a portfolio"""
+    try:
+        portfolio = get_portfolio_state(portfolio_id)
+        return portfolio
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Portfolio not found: {e}")
+
+
+@app.post("/trading/pause-portfolio/{portfolio_id}")
+async def pause_portfolio(portfolio_id: int):
+    """Pause a portfolio (stop trading)"""
+    try:
+        update_portfolio(portfolio_id, {'status': 'paused'})
+        return {"status": "paused", "portfolio_id": portfolio_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/trading/resume-portfolio/{portfolio_id}")
+async def resume_portfolio(portfolio_id: int):
+    """Resume a paused portfolio"""
+    try:
+        update_portfolio(portfolio_id, {'status': 'active'})
+        return {"status": "active", "portfolio_id": portfolio_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8004)
+```
+
+### What to Remove from Current Trading Controller
+
+Remove all strategy-specific logic:
+
+1. **Signal Generation Logic**: Move to strategy controllers
+   - Market filtering based on strategy criteria
+   - Indicator calculations (momentum, mean reversion, etc.)
+   - Signal confidence scoring
+   - Entry/exit decision logic
+
+2. **Strategy-Specific Endpoints**: Remove or deprecate
+   - `/strategy/generate-signals` (move to strategy controllers)
+   - Any endpoints with hardcoded strategy logic
+
+3. **Strategy Configuration**: Remove hardcoded config
+   - Strategy thresholds
+   - Market filters specific to one strategy
+   - Indicator parameters
+
+### What to Keep in Trading Controller
+
+Keep orchestration and coordination logic:
+
+1. **Orchestration Endpoints**:
+   - `/trading/run-portfolio-cycle` - Routes to strategy controllers
+   - `/trading/run-all-portfolios` - Processes all portfolios
+   - Portfolio management endpoints (pause, resume, status)
+
+2. **Data Collection Coordination**:
+   - `ensure_shared_data_collected()` - Calls events/markets controllers
+   - Shared data refresh logic
+
+3. **Portfolio State Management**:
+   - Portfolio snapshot creation
+   - Portfolio history tracking
+   - System-level monitoring
+
+### Benefits of This Architecture
+
+1. **Separation of Concerns**: Each strategy controller focuses on its own logic
+2. **Independent Development**: Strategies can be developed and tested independently
+3. **Easy Testing**: Test strategies in isolation without full system
+4. **Scalability**: Add new strategies without modifying trading controller
+5. **Maintainability**: Clear boundaries between orchestration and strategy logic
+6. **Flexibility**: Each strategy can have completely different flow and logic
+
+### Implementation Order
+
+1. **Create Strategy Controllers**: Start with momentum and mean_reversion controllers
+2. **Implement `/strategy/run-full-cycle`**: Add strategy-specific logic to each controller
+3. **Refactor Trading Controller**: Remove strategy logic, add routing to strategy controllers
+4. **Test Individually**: Test each strategy controller independently
+5. **Integration Testing**: Test full cycle with trading controller routing to strategies
+6. **Deploy**: Start strategy controllers on their assigned ports, update trading controller
+
+### Testing Strategy Controllers
+
+```python
+# test_momentum_strategy.py
+import pytest
+from momentum_strategy_controller import calculate_momentum, generate_momentum_signals
+
+def test_calculate_momentum():
+    """Test momentum calculation"""
+    market = {
+        'market_id': 'test_market',
+        'yes_price': 0.65
+    }
+
+    momentum = calculate_momentum(market)
+    assert -1.0 <= momentum <= 1.0
+
+
+def test_generate_signals_high_momentum():
+    """Test signal generation for high momentum market"""
+    markets = [{
+        'market_id': 'test_market',
+        'yes_price': 0.65,
+        'momentum_score': 0.8,
+        'price_velocity': 0.06
+    }]
+
+    portfolio = {'portfolio_id': 1, 'strategy_config': {}}
+    signals = generate_momentum_signals(markets, portfolio, 0.7, 0.05)
+
+    assert len(signals) == 1
+    assert signals[0]['action'] == 'BUY'
+```
+
 ---
 
 ## Conclusion
 
-This migration plan provides a complete roadmap for implementing the Portfolio-Centric Architecture in Prescient OS. The approach delivers:
+This implementation plan provides a complete roadmap for implementing the Portfolio-Centric Architecture in Prescient OS. The approach delivers:
 
 ✅ **True portfolio isolation** with separate capital and P&L
 ✅ **Scalable architecture** supporting 100+ portfolios
-✅ **Backward compatibility** via migration script
+✅ **Clean rebuild** without migration complexity
 ✅ **Professional-grade** trading system design
 ✅ **Clear implementation** with code examples
 
 **Success Criteria:**
-- Zero data loss during migration
-- All existing functionality preserved
+- Clean database schema with portfolio support from day one
+- All functionality working with new portfolio architecture
 - Ability to create and run multiple portfolios independently
 - Price updates complete within 5-minute window for all portfolios
 - Clean separation between portfolio strategies
+- Old schema preserved in git history for reference
 
 **Next Steps After Implementation:**
 1. Create additional strategy controllers (mean reversion, arbitrage)
@@ -2739,6 +2969,383 @@ This migration plan provides a complete roadmap for implementing the Portfolio-C
 3. Add automated portfolio rebalancing
 4. Implement machine learning for strategy optimization
 5. Add backtesting framework for strategy validation
+
+---
+
+## Visual Architecture Diagrams
+
+### 1. Complete System Flow: Multi-Portfolio Trading Cycle
+
+```mermaid
+graph TD
+    Start([Scheduled Trading Cycle]) --> TC[Trading Controller<br/>Port 8004<br/>Orchestrator]
+
+    TC --> CollectData{Collect Shared Data<br/>ONCE for all portfolios}
+    CollectData --> EC[Events Controller<br/>Port 8000]
+    CollectData --> MC[Markets Controller<br/>Port 8001]
+
+    EC --> DB[(PostgreSQL<br/>Shared Tables)]
+    MC --> DB
+
+    DB --> GetPortfolios[Get All Active Portfolios<br/>FROM portfolios table]
+
+    GetPortfolios --> P1[Portfolio 1<br/>Aggressive Momentum<br/>$10,000]
+    GetPortfolios --> P2[Portfolio 2<br/>Conservative Mean Rev<br/>$5,000]
+    GetPortfolios --> P3[Portfolio 3<br/>Hybrid Strategy<br/>$15,000]
+
+    P1 --> Route1{Check Strategy Type:<br/>momentum}
+    P2 --> Route2{Check Strategy Type:<br/>mean_reversion}
+    P3 --> Route3{Check Strategy Type:<br/>hybrid}
+
+    Route1 --> SC1[Momentum Strategy<br/>Controller<br/>Port 8002]
+    Route2 --> SC2[Mean Reversion Strategy<br/>Controller<br/>Port 8005]
+    Route3 --> SC3[Hybrid Strategy<br/>Controller<br/>Port 8007]
+
+    SC1 --> Filter1[Filter Markets<br/>min_liquidity: 1000<br/>categories: sports, crypto]
+    SC2 --> Filter2[Filter Markets<br/>min_liquidity: 2000<br/>z_score threshold: 2.0]
+    SC3 --> Filter3[Filter Markets<br/>Combined filters]
+
+    Filter1 --> Calc1[Calculate Momentum<br/>price velocity<br/>volume acceleration]
+    Filter2 --> Calc2[Calculate Z-Scores<br/>mean prices<br/>std deviation]
+    Filter3 --> Calc3[Combined Calculations<br/>momentum + mean rev]
+
+    Calc1 --> Signals1[Generate Signals<br/>BUY on strong momentum]
+    Calc2 --> Signals2[Generate Signals<br/>BUY oversold, SELL overbought]
+    Calc3 --> Signals3[Generate Signals<br/>Hybrid logic]
+
+    Signals1 --> Store1[(Store Signals<br/>portfolio_id=1)]
+    Signals2 --> Store2[(Store Signals<br/>portfolio_id=2)]
+    Signals3 --> Store3[(Store Signals<br/>portfolio_id=3)]
+
+    Store1 --> Execute[Paper Trading Controller<br/>Port 8003<br/>Execute Signals]
+    Store2 --> Execute
+    Store3 --> Execute
+
+    Execute --> UpdateP1[Update Portfolio 1<br/>balance, positions, PnL]
+    Execute --> UpdateP2[Update Portfolio 2<br/>balance, positions, PnL]
+    Execute --> UpdateP3[Update Portfolio 3<br/>balance, positions, PnL]
+
+    UpdateP1 --> Snapshot1[Create Snapshot 1]
+    UpdateP2 --> Snapshot2[Create Snapshot 2]
+    UpdateP3 --> Snapshot3[Create Snapshot 3]
+
+    Snapshot1 --> Complete([Cycle Complete])
+    Snapshot2 --> Complete
+    Snapshot3 --> Complete
+
+    style TC fill:#4A90E2,stroke:#2E5C8A,color:#fff
+    style EC fill:#F5A623,stroke:#C17D11,color:#fff
+    style MC fill:#F5A623,stroke:#C17D11,color:#fff
+    style SC1 fill:#7ED321,stroke:#5FA319,color:#fff
+    style SC2 fill:#7ED321,stroke:#5FA319,color:#fff
+    style SC3 fill:#7ED321,stroke:#5FA319,color:#fff
+    style Execute fill:#BD10E0,stroke:#8B0AA8,color:#fff
+    style DB fill:#50E3C2,stroke:#2EB39E,color:#000
+    style Complete fill:#417505,stroke:#2D5103,color:#fff
+```
+
+### 2. Database Schema: Portfolio-Centric Architecture
+
+```mermaid
+erDiagram
+    PORTFOLIOS ||--o{ POSITIONS : "has many"
+    PORTFOLIOS ||--o{ TRADES : "has many"
+    PORTFOLIOS ||--o{ TRADING_SIGNALS : "generates"
+    PORTFOLIOS ||--o{ PORTFOLIO_SNAPSHOTS : "tracked by"
+    PORTFOLIOS ||--o{ RISK_LIMITS : "enforces"
+
+    MARKETS ||--o{ POSITIONS : "referenced by"
+    MARKETS ||--o{ TRADES : "executed on"
+    MARKETS ||--o{ TRADING_SIGNALS : "target"
+    EVENTS ||--o{ MARKETS : "contains"
+
+    PORTFOLIOS {
+        int portfolio_id PK
+        string name "unique"
+        string strategy_type "momentum, mean_reversion, etc"
+        decimal current_balance
+        decimal initial_balance
+        decimal total_profit_loss
+        jsonb strategy_config "flexible config"
+        string status "active, paused, closed"
+        timestamp created_at
+    }
+
+    POSITIONS {
+        int position_id PK
+        int portfolio_id FK
+        string market_id FK
+        int quantity
+        string outcome "YES or NO"
+        decimal avg_entry_price
+        decimal current_value
+        decimal unrealized_pnl
+        timestamp opened_at
+    }
+
+    TRADES {
+        int trade_id PK
+        int portfolio_id FK
+        string market_id FK
+        string action "BUY or SELL"
+        string outcome "YES or NO"
+        int quantity
+        decimal price
+        decimal total_cost
+        decimal realized_pnl
+        timestamp executed_at
+    }
+
+    TRADING_SIGNALS {
+        int signal_id PK
+        int portfolio_id FK
+        string market_id FK
+        string action "BUY or SELL"
+        decimal target_price
+        decimal confidence
+        string reasoning
+        string status "pending, executed, expired"
+        timestamp created_at
+    }
+
+    PORTFOLIO_SNAPSHOTS {
+        int snapshot_id PK
+        int portfolio_id FK
+        decimal balance
+        decimal total_value
+        decimal profit_loss
+        int active_positions
+        timestamp captured_at
+    }
+
+    EVENTS {
+        string event_id PK
+        string title
+        string category
+        timestamp start_date
+    }
+
+    MARKETS {
+        string market_id PK
+        string event_id FK
+        string question
+        decimal yes_price
+        decimal no_price
+        decimal volume
+        decimal liquidity
+    }
+
+    RISK_LIMITS {
+        int limit_id PK
+        int portfolio_id FK
+    }
+```
+
+### 3. Strategy Controller Architecture: Port Mapping
+
+```mermaid
+graph LR
+    TC[Trading Controller<br/>Port 8004<br/>Orchestrator]
+
+    TC -->|strategy_type:<br/>momentum| SC1[Momentum Strategy<br/>Port 8002<br/>momentum_strategy_controller.py]
+    TC -->|strategy_type:<br/>mean_reversion| SC2[Mean Reversion Strategy<br/>Port 8005<br/>mean_reversion_strategy_controller.py]
+    TC -->|strategy_type:<br/>arbitrage| SC3[Arbitrage Strategy<br/>Port 8006<br/>arbitrage_strategy_controller.py]
+    TC -->|strategy_type:<br/>hybrid| SC4[Hybrid Strategy<br/>Port 8007<br/>hybrid_strategy_controller.py]
+
+    SC1 --> Logic1[Momentum Logic:<br/>- Calculate price velocity<br/>- Track volume acceleration<br/>- BUY on strong momentum]
+    SC2 --> Logic2[Mean Reversion Logic:<br/>- Calculate z-scores<br/>- Identify oversold/overbought<br/>- BUY low, SELL high]
+    SC3 --> Logic3[Arbitrage Logic:<br/>- Find price discrepancies<br/>- Cross-market opportunities<br/>- Risk-free profits]
+    SC4 --> Logic4[Hybrid Logic:<br/>- Combine multiple strategies<br/>- Dynamic weighting<br/>- Adaptive approach]
+
+    Logic1 --> Signals[(Trading Signals<br/>Database)]
+    Logic2 --> Signals
+    Logic3 --> Signals
+    Logic4 --> Signals
+
+    style TC fill:#4A90E2,stroke:#2E5C8A,color:#fff
+    style SC1 fill:#7ED321,stroke:#5FA319,color:#fff
+    style SC2 fill:#7ED321,stroke:#5FA319,color:#fff
+    style SC3 fill:#7ED321,stroke:#5FA319,color:#fff
+    style SC4 fill:#7ED321,stroke:#5FA319,color:#fff
+    style Signals fill:#50E3C2,stroke:#2EB39E,color:#000
+```
+
+### 4. Data Flow: Shared vs Portfolio-Specific
+
+```mermaid
+graph TD
+    subgraph "SHARED DATA LAYER - Collected Once"
+        Events[Events Controller<br/>Fetches ALL Events<br/>Polymarket API]
+        Markets[Markets Controller<br/>Fetches ALL Markets<br/>Polymarket API]
+        EventsDB[(events table<br/>Shared across all portfolios)]
+        MarketsDB[(markets table<br/>Shared across all portfolios)]
+
+        Events --> EventsDB
+        Markets --> MarketsDB
+    end
+
+    subgraph "PORTFOLIO-SPECIFIC LAYER - Filtered Per Portfolio"
+        EventsDB --> Filter1[Portfolio 1 Filters<br/>categories: sports, crypto<br/>min_liquidity: 1000]
+        MarketsDB --> Filter1
+
+        EventsDB --> Filter2[Portfolio 2 Filters<br/>categories: politics<br/>min_liquidity: 2000]
+        MarketsDB --> Filter2
+
+        EventsDB --> Filter3[Portfolio 3 Filters<br/>categories: all<br/>min_volume: 500]
+        MarketsDB --> Filter3
+
+        Filter1 --> Strategy1[Momentum Strategy<br/>Portfolio 1]
+        Filter2 --> Strategy2[Mean Reversion Strategy<br/>Portfolio 2]
+        Filter3 --> Strategy3[Hybrid Strategy<br/>Portfolio 3]
+    end
+
+    subgraph "ISOLATED PORTFOLIO DATA"
+        Strategy1 --> P1Data[(Portfolio 1:<br/>positions, trades,<br/>signals, snapshots)]
+        Strategy2 --> P2Data[(Portfolio 2:<br/>positions, trades,<br/>signals, snapshots)]
+        Strategy3 --> P3Data[(Portfolio 3:<br/>positions, trades,<br/>signals, snapshots)]
+    end
+
+    style Events fill:#F5A623,stroke:#C17D11,color:#fff
+    style Markets fill:#F5A623,stroke:#C17D11,color:#fff
+    style EventsDB fill:#50E3C2,stroke:#2EB39E,color:#000
+    style MarketsDB fill:#50E3C2,stroke:#2EB39E,color:#000
+    style Strategy1 fill:#7ED321,stroke:#5FA319,color:#fff
+    style Strategy2 fill:#7ED321,stroke:#5FA319,color:#fff
+    style Strategy3 fill:#7ED321,stroke:#5FA319,color:#fff
+    style P1Data fill:#BD10E0,stroke:#8B0AA8,color:#fff
+    style P2Data fill:#BD10E0,stroke:#8B0AA8,color:#fff
+    style P3Data fill:#BD10E0,stroke:#8B0AA8,color:#fff
+```
+
+### 5. Portfolio Lifecycle: From Creation to Execution
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: Create Portfolio<br/>(name, strategy_type, initial_balance)
+
+    Created --> Configured: Add Strategy Config<br/>(filters, thresholds, parameters)
+
+    Configured --> Active: Activate Portfolio<br/>(status = 'active')
+
+    Active --> Running: Trading Cycle Starts
+
+    Running --> FetchData: Fetch Shared Data<br/>(events, markets)
+
+    FetchData --> FilterData: Apply Portfolio Filters<br/>(based on strategy_config)
+
+    FilterData --> RouteStrategy: Route to Strategy Controller<br/>(based on strategy_type)
+
+    RouteStrategy --> Momentum: Momentum Strategy<br/>(Port 8002)
+    RouteStrategy --> MeanRev: Mean Reversion Strategy<br/>(Port 8005)
+    RouteStrategy --> Arbitrage: Arbitrage Strategy<br/>(Port 8006)
+    RouteStrategy --> Hybrid: Hybrid Strategy<br/>(Port 8007)
+
+    Momentum --> GenerateSignals: Calculate Indicators<br/>Generate Signals
+    MeanRev --> GenerateSignals
+    Arbitrage --> GenerateSignals
+    Hybrid --> GenerateSignals
+
+    GenerateSignals --> ExecuteSignals: Paper Trading Controller<br/>Executes Signals
+
+    ExecuteSignals --> UpdatePortfolio: Update Balance<br/>Update Positions<br/>Calculate PnL
+
+    UpdatePortfolio --> Snapshot: Create Portfolio Snapshot<br/>(historical record)
+
+    Snapshot --> Active: Wait for Next Cycle
+
+    Active --> Paused: User Pauses<br/>(status = 'paused')
+    Paused --> Active: User Resumes<br/>(status = 'active')
+
+    Active --> Closed: Close Portfolio<br/>(status = 'closed')
+    Paused --> Closed
+
+    Closed --> [*]
+
+    note right of RouteStrategy
+        Key Decision Point:
+        Portfolio's strategy_type
+        determines which controller
+        handles the trading logic
+    end note
+
+    note right of FilterData
+        Each portfolio applies
+        its own filters to the
+        shared market data
+    end note
+```
+
+### 6. Key Insight: Portfolio Isolation
+
+```mermaid
+graph TB
+    subgraph "Portfolio Isolation Model"
+        P1[Portfolio 1: Aggressive Momentum<br/>$10,000 Balance]
+        P2[Portfolio 2: Conservative Mean Rev<br/>$5,000 Balance]
+        P3[Portfolio 3: Hybrid Strategy<br/>$15,000 Balance]
+    end
+
+    subgraph "Portfolio 1 Data - ISOLATED"
+        P1Bal[$10,000 current_balance]
+        P1Pos[15 open positions]
+        P1Trades[247 trades]
+        P1PnL[+$1,250 total_profit_loss]
+
+        P1 --> P1Bal
+        P1 --> P1Pos
+        P1 --> P1Trades
+        P1 --> P1PnL
+    end
+
+    subgraph "Portfolio 2 Data - ISOLATED"
+        P2Bal[$5,200 current_balance]
+        P2Pos[8 open positions]
+        P2Trades[89 trades]
+        P2PnL[+$200 total_profit_loss]
+
+        P2 --> P2Bal
+        P2 --> P2Pos
+        P2 --> P2Trades
+        P2 --> P2PnL
+    end
+
+    subgraph "Portfolio 3 Data - ISOLATED"
+        P3Bal[$14,500 current_balance]
+        P3Pos[22 open positions]
+        P3Trades[356 trades]
+        P3PnL[-$500 total_profit_loss]
+
+        P3 --> P3Bal
+        P3 --> P3Pos
+        P3 --> P3Trades
+        P3 --> P3PnL
+    end
+
+    subgraph "Shared Market Data - NOT ISOLATED"
+        SharedEvents[(events table<br/>5,000+ events)]
+        SharedMarkets[(markets table<br/>50,000+ markets)]
+
+        P1 -.reads.-> SharedEvents
+        P1 -.reads.-> SharedMarkets
+        P2 -.reads.-> SharedEvents
+        P2 -.reads.-> SharedMarkets
+        P3 -.reads.-> SharedEvents
+        P3 -.reads.-> SharedMarkets
+    end
+
+    Note1[Key Insight 1:<br/>Each portfolio has completely<br/>separate capital, positions,<br/>trades, and PnL tracking]
+    Note2[Key Insight 2:<br/>All portfolios read from the<br/>same shared events/markets data,<br/>but filter it differently]
+    Note3[Key Insight 3:<br/>Portfolios cannot affect<br/>each other - true isolation<br/>for risk management]
+
+    style P1 fill:#7ED321,stroke:#5FA319,color:#fff
+    style P2 fill:#4A90E2,stroke:#2E5C8A,color:#fff
+    style P3 fill:#BD10E0,stroke:#8B0AA8,color:#fff
+    style SharedEvents fill:#50E3C2,stroke:#2EB39E,color:#000
+    style SharedMarkets fill:#50E3C2,stroke:#2EB39E,color:#000
+    style Note1 fill:#FFD700,stroke:#B8860B,color:#000
+    style Note2 fill:#FFD700,stroke:#B8860B,color:#000
+    style Note3 fill:#FFD700,stroke:#B8860B,color:#000
+```
 
 ---
 
