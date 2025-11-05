@@ -42,8 +42,11 @@ Since this is a fundamental architecture change and we don't need to preserve ex
 5. [Controller Architecture Changes](#controller-architecture-changes)
 6. [Price Updater Modifications](#price-updater-modifications)
 7. [Trading Cycle Orchestration](#trading-cycle-orchestration)
-8. [Implementation Steps](#implementation-steps)
+8. [Implementation Guide](#implementation-guide) ⭐ **Start Here**
 9. [Testing Strategy](#testing-strategy)
+10. [API Documentation](#api-documentation)
+11. [Performance Considerations](#performance-considerations)
+12. [Risk Management](#risk-management)
 
 ---
 
@@ -1764,26 +1767,40 @@ def create_daily_portfolio_snapshot(portfolio_data: Dict, portfolio_id: int):
 
 ---
 
-## Implementation Steps
+## Implementation Guide
 
-Since we're doing a clean rebuild, the process is straightforward:
+This guide walks you through implementing the portfolio-centric architecture from start to finish. Since we're doing a clean rebuild (no data migration), the process is straightforward and can be completed in 2-3 weeks.
 
-### Step 1: Save Current State (Git)
+---
+
+### Phase 1: Database Schema (Days 1-2)
+
+#### Step 1: Save Current State
+
+Before making any changes, commit your current work to preserve the old schema in git history:
 
 ```bash
-# Commit any current changes
 git add .
 git commit -m "Save state before portfolio architecture migration"
 ```
 
-### Step 2: Create New Schema File
+#### Step 2: Create New Schema File
 
-Create a new SQL file `src/db/schema_v2_portfolios.sql` with all the table definitions from the "New Database Schema" section above.
+Create `src/db/schema_v2_portfolios.sql` with all table definitions from the [New Database Schema](#new-database-schema) section above. This includes:
 
-### Step 3: Drop and Recreate Database
+- `portfolios` table (replaces `portfolio_state`)
+- `portfolio_positions` table (with `portfolio_id` FK)
+- `trades` table (with `portfolio_id` FK)
+- `trading_signals` table (with `portfolio_id` FK)
+- `portfolio_history` table (with `portfolio_id` FK)
+- All indexes and constraints
+
+#### Step 3: Drop and Recreate Database
+
+**WARNING: This will delete all existing data. Only run locally!**
 
 ```bash
-# Drop existing database (local only!)
+# Drop existing database
 psql -U postgres -c "DROP DATABASE prescient_trading_db;"
 
 # Create fresh database
@@ -1793,10 +1810,168 @@ psql -U postgres -c "CREATE DATABASE prescient_trading_db;"
 psql -U postgres -d prescient_trading_db -f src/db/schema_v2_portfolios.sql
 ```
 
-### Step 4: Create Initial Portfolio
+Verify the schema was created successfully:
+
+```bash
+psql -U postgres -d prescient_trading_db -c "\dt"
+psql -U postgres -d prescient_trading_db -c "\d portfolios"
+```
+
+---
+
+### Phase 2: Database Operations Layer (Days 3-5)
+
+Update `src/db/operations.py` to support the portfolio architecture. See the [Database Operations Layer Changes](#database-operations-layer-changes) section for detailed code.
+
+#### Step 4: Update Core Functions
+
+**4.1 Portfolio Management Functions**
+- `create_portfolio(portfolio_data)` - Create new portfolio
+- `get_portfolio_state(portfolio_id)` - Get portfolio state
+- `get_all_portfolios(status)` - List all portfolios
+- `update_portfolio(portfolio_id, updates)` - Update portfolio
+- `_get_default_portfolio_id()` - Helper for backward compatibility
+
+**4.2 Update Position Functions**
+- Add `portfolio_id` parameter to `add_portfolio_position()`
+- Add `portfolio_id` parameter to `get_portfolio_positions()`
+- Add `portfolio_id` filter to position queries
+
+**4.3 Update Trade Functions**
+- Add `portfolio_id` parameter to `insert_trade()`
+- Add `portfolio_id` parameter to `get_trades()`
+- Add `portfolio_id` filter to trade queries
+
+**4.4 Update Signal Functions**
+- Add `portfolio_id` parameter to `insert_trading_signal()`
+- Add `portfolio_id` parameter to `get_pending_signals()`
+
+**4.5 Update History Functions**
+- Add `portfolio_id` parameter to `insert_portfolio_history_snapshot()`
+- Add `portfolio_id` filter to history queries
+
+#### Step 5: Test Database Operations
+
+Create a test script to verify all database operations work:
 
 ```python
-# Run this once to create your first portfolio
+# test_portfolio_migration.py
+from src.db.operations import *
+
+# Test 1: Create portfolio
+portfolio_id = create_portfolio({
+    'name': 'Test Portfolio',
+    'description': 'Testing migration',
+    'strategy_type': 'momentum',
+    'initial_balance': 10000,
+    'strategy_config': {'min_confidence': 0.75}
+})
+print(f"✓ Created portfolio {portfolio_id}")
+
+# Test 2: Get portfolio
+portfolio = get_portfolio_state(portfolio_id)
+assert portfolio['name'] == 'Test Portfolio'
+print(f"✓ Retrieved portfolio {portfolio_id}")
+
+# Test 3: Add position
+position_id = add_portfolio_position(portfolio_id, {
+    'trade_id': 'test_trade_1',
+    'market_id': 'test_market',
+    'action': 'BUY',
+    'amount': 100,
+    'entry_price': 0.5
+})
+print(f"✓ Added position {position_id}")
+
+# Test 4: Get positions
+positions = get_portfolio_positions(portfolio_id)
+assert len(positions) == 1
+print(f"✓ Retrieved {len(positions)} positions")
+
+print("\n✅ All database operations working!")
+```
+
+Run the test:
+```bash
+python test_portfolio_migration.py
+```
+
+---
+
+### Phase 3: Controller Updates (Days 6-10)
+
+#### Step 6: Update Paper Trading Controller
+
+Update `src/controllers/paper_trading_controller.py`:
+
+**6.1 Add Portfolio Management Endpoints**
+- `POST /portfolios/create` - Create portfolio
+- `GET /paper-trading/portfolio?portfolio_id=X` - Get portfolio
+- `GET /paper-trading/portfolio` - Get all portfolios
+- `PATCH /portfolios/{portfolio_id}` - Update portfolio
+
+**6.2 Update Existing Endpoints**
+- Add `portfolio_id` parameter to all position/trade queries
+- Use `_get_default_portfolio_id()` for backward compatibility
+- Filter all queries by portfolio_id
+
+See [Controller Architecture Changes](#controller-architecture-changes) section for detailed code.
+
+#### Step 7: Update Price Updater
+
+Update `src/controllers/price_updater.py` to support multiple portfolios:
+
+**7.1 Modify Price Update Logic**
+```python
+def update_all_portfolio_prices():
+    """Update prices for all active portfolios"""
+    portfolios = get_all_portfolios(status='active')
+
+    for portfolio in portfolios:
+        portfolio_id = portfolio['portfolio_id']
+        positions = get_portfolio_positions(portfolio_id, status='open')
+
+        for position in positions:
+            # Update position price and P&L
+            update_position_price(portfolio_id, position)
+
+        # Update portfolio totals
+        recalculate_portfolio_totals(portfolio_id)
+```
+
+**7.2 Add Portfolio-Specific Endpoints**
+- `GET /price-updater/update?portfolio_id=X` - Update one portfolio
+- `GET /price-updater/update-all` - Update all portfolios
+
+See [Price Updater Modifications](#price-updater-modifications) section for details.
+
+#### Step 8: Update Trading Controller
+
+Update `src/controllers/trading_controller.py` for portfolio orchestration:
+
+**8.1 Add Portfolio Cycle Endpoints**
+- `GET /trading/run-portfolio-cycle?portfolio_id=X` - Run cycle for one portfolio
+- `GET /trading/run-all-portfolios` - Run cycle for all active portfolios
+
+**8.2 Update Cycle Logic**
+```python
+def run_portfolio_trading_cycle(portfolio_id: int):
+    """Run complete trading cycle for one portfolio"""
+    # 1. Fetch markets (shared)
+    # 2. Generate signals for this portfolio
+    # 3. Execute trades for this portfolio
+    # 4. Update prices for this portfolio
+    # 5. Update portfolio state
+```
+
+See [Trading Cycle Orchestration](#trading-cycle-orchestration) section for complete code.
+
+#### Step 9: Create Initial Portfolio
+
+Create your first portfolio using a Python script or API call:
+
+```python
+# scripts/create_default_portfolio.py
 from src.db.operations import create_portfolio
 
 portfolio_id = create_portfolio({
@@ -1810,28 +1985,209 @@ portfolio_id = create_portfolio({
         'market_types': ['politics', 'crypto']
     }
 })
+
+print(f"✅ Created default portfolio with ID: {portfolio_id}")
 ```
 
-### Step 5: Update Code
+---
 
-Update all the database operation functions as documented in the sections below.
+### Phase 4: Testing & Validation (Days 11-14)
 
-### Step 6: Test
+#### Step 10: Unit Testing
 
-Run through a complete trading cycle to verify everything works.
+Create comprehensive unit tests in `tests/test_portfolio_operations.py`:
 
-### Step 7: Commit
+```python
+def test_create_portfolio():
+    """Test portfolio creation"""
+    portfolio_data = {
+        'name': 'Test Portfolio',
+        'strategy_type': 'momentum',
+        'initial_balance': 10000
+    }
+    portfolio_id = create_portfolio(portfolio_data)
+    assert portfolio_id > 0
+
+def test_portfolio_isolation():
+    """Test that portfolios are isolated"""
+    # Create two portfolios
+    p1 = create_portfolio({'name': 'P1', 'strategy_type': 'momentum', 'initial_balance': 10000})
+    p2 = create_portfolio({'name': 'P2', 'strategy_type': 'momentum', 'initial_balance': 20000})
+
+    # Add position to P1
+    add_portfolio_position(p1, {...})
+
+    # Verify P2 has no positions
+    p2_positions = get_portfolio_positions(p2)
+    assert len(p2_positions) == 0
+```
+
+Run tests:
+```bash
+pytest tests/test_portfolio_operations.py -v
+```
+
+#### Step 11: Integration Testing
+
+Test the complete trading cycle end-to-end:
+
+```bash
+# Start all controllers
+python src/controllers/events_controller.py &
+python src/controllers/markets_controller.py &
+python src/controllers/price_updater.py &
+python src/controllers/paper_trading_controller.py &
+python src/controllers/trading_controller.py &
+
+# Run a complete cycle for your portfolio
+curl "http://localhost:8004/trading/run-portfolio-cycle?portfolio_id=1"
+
+# Verify results
+curl "http://localhost:8003/paper-trading/portfolio?portfolio_id=1"
+```
+
+#### Step 12: Multi-Portfolio Testing
+
+Test with multiple portfolios to ensure isolation:
+
+```python
+# Create 3 different portfolios
+portfolios = [
+    create_portfolio({'name': 'Aggressive', 'strategy_type': 'momentum', 'initial_balance': 50000}),
+    create_portfolio({'name': 'Conservative', 'strategy_type': 'momentum', 'initial_balance': 10000}),
+    create_portfolio({'name': 'Experimental', 'strategy_type': 'momentum', 'initial_balance': 5000})
+]
+
+# Run cycles for all portfolios
+for pid in portfolios:
+    run_portfolio_trading_cycle(pid)
+
+# Verify each portfolio maintained independent state
+for pid in portfolios:
+    portfolio = get_portfolio_state(pid)
+    print(f"{portfolio['name']}: ${portfolio['current_balance']}, {len(portfolio['positions'])} positions")
+```
+
+---
+
+### Phase 5: Final Steps (Days 15+)
+
+#### Step 13: Performance Testing
+
+Test system performance with multiple portfolios:
+
+```python
+# Create 10+ portfolios
+for i in range(10):
+    create_portfolio({
+        'name': f'Portfolio {i+1}',
+        'strategy_type': 'momentum',
+        'initial_balance': 10000
+    })
+
+# Measure time to run all portfolio cycles
+import time
+start = time.time()
+run_all_portfolio_cycles()
+duration = time.time() - start
+
+print(f"Completed 10 portfolio cycles in {duration:.2f} seconds")
+# Should complete within 5-10 minutes
+```
+
+#### Step 14: Commit Changes
+
+Once everything is working, commit the changes:
 
 ```bash
 git add .
 git commit -m "BREAKING: Migrate to portfolio-centric architecture with multiple portfolio support
 
+Database Changes:
 - Replace portfolio_state table with portfolios table
-- Add portfolio_id foreign keys to all related tables
-- Update all database operations to support portfolio context
+- Add portfolio_id foreign keys to all related tables (positions, trades, signals, history)
+- Remove portfolio-level risk management fields
+
+Code Changes:
+- Update all database operations to support portfolio_id parameter
 - Update controllers to handle portfolio-specific cycles
-- Old schema preserved in git history"
+- Add portfolio management endpoints (create, list, update)
+- Update price updater for multi-portfolio support
+- Update trading orchestration for parallel portfolio execution
+
+Features:
+- Support unlimited concurrent portfolios with different strategies
+- True portfolio isolation (separate capital, P&L, positions)
+- Backward compatibility via default portfolio ID
+- Portfolio performance tracking and history
+
+Migration:
+- Clean rebuild (no data migration needed)
+- Old schema preserved in git history
+
+Tested with 10+ portfolios running concurrent trading cycles"
 ```
+
+#### Step 15: Documentation
+
+Update your README and create documentation:
+
+1. **README.md** - Add section on portfolio management
+2. **API_DOCS.md** - Document new portfolio endpoints
+3. **ARCHITECTURE.md** - Explain portfolio-centric design
+4. **CHANGELOG.md** - Document breaking changes
+
+---
+
+### Rollback Plan
+
+If you encounter critical issues:
+
+**Option 1: Revert via Git**
+```bash
+# Revert to previous commit
+git reset --hard HEAD~1
+
+# Restore previous schema
+psql -U postgres -d prescient_trading_db -f src/db/schema_v1_original.sql
+```
+
+**Option 2: Fix Forward**
+- Keep new schema
+- Fix bugs in code
+- Use git to compare old vs new implementations
+- Test incrementally
+
+---
+
+### Success Criteria
+
+You've successfully completed the migration when:
+
+- ✅ Database schema created with all portfolio tables
+- ✅ All database operations accept `portfolio_id` parameter
+- ✅ Can create and manage multiple portfolios via API
+- ✅ Each portfolio maintains independent state (balance, positions, P&L)
+- ✅ Price updates work for all portfolios
+- ✅ Trading cycles work for individual or all portfolios
+- ✅ Unit tests pass
+- ✅ Integration tests pass with multiple portfolios
+- ✅ Performance is acceptable (10 portfolios in <10 minutes)
+- ✅ Old schema preserved in git history
+- ✅ Documentation updated
+
+---
+
+### Next Steps After Migration
+
+Once the portfolio architecture is working:
+
+1. **Create Additional Strategy Controllers** - Implement mean reversion, arbitrage strategies
+2. **Build Portfolio Dashboard** - Visual interface for managing portfolios
+3. **Add Portfolio Analytics** - Sharpe ratio, max drawdown, win rate by portfolio
+4. **Implement Portfolio Rebalancing** - Automatic capital reallocation
+5. **Add Backtesting** - Test strategies against historical data per portfolio
+6. **Machine Learning Integration** - Strategy optimization per portfolio
 
 ---
 
@@ -2111,62 +2467,6 @@ def test_concurrent_portfolio_cycles():
 
 ---
 
-## Deployment Plan
-
-### Phase 1: Development (Week 1-2)
-
-**Week 1: Database Layer**
-- Day 1-2: Create migration script, test on dev database
-- Day 3-4: Update `src/db/operations.py` with new functions
-- Day 5: Unit testing for all database operations
-
-**Week 2: Core Controllers**
-- Day 1-2: Update paper trading controller
-- Day 3-4: Update price updater
-- Day 5: Integration testing
-
-### Phase 2: Controllers & Orchestration (Week 3-4)
-
-**Week 3: Trading Orchestration**
-- Day 1-2: Update trading controller with portfolio endpoints
-- Day 3-4: Add portfolio management endpoints
-- Day 5: End-to-end testing
-
-**Week 4: Strategy Layer**
-- Day 1-3: Modify strategy controller for portfolio context
-- Day 4-5: Testing with multiple portfolios
-
-### Phase 3: Testing & Validation (Week 5)
-
-**Week 5: Comprehensive Testing**
-- Day 1-2: Unit testing all components
-- Day 3: Integration testing full cycles
-- Day 4: Performance testing with 10+ portfolios
-- Day 5: Bug fixes and optimization
-
-### Phase 4: Production Deployment (Week 6)
-
-**Week 6: Deployment**
-- Day 1: Final testing in staging environment
-- Day 2: Run migration script on production database (with backup!)
-- Day 3: Deploy updated controllers
-- Day 4: Monitor system, create first new portfolios
-- Day 5: Documentation and training
-
-### Rollback Plan
-
-If issues occur during deployment:
-
-1. **Stop all controllers** to prevent data corruption
-2. **Restore database** from backup:
-   ```bash
-   psql prescient_trading_db < backup_before_portfolio_migration_YYYYMMDD_HHMMSS.sql
-   ```
-3. **Revert code** to previous version
-4. **Restart controllers** with old code
-5. **Investigate** the issue before re-attempting
-
----
 
 ## API Documentation
 
