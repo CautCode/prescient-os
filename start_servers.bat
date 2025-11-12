@@ -57,16 +57,16 @@ echo [2/5] Starting Markets Controller (Port 8001)...
 start "Markets Controller" cmd /k "%VENV_PATH% && uvicorn src.market_controller:app --reload --port 8001 %DEBUG_FLAGS%"
 timeout /t 2 /nobreak > nul
 
-echo [3/5] Starting Trading Strategy Controller (Port 8002)...
-start "Strategy Controller" cmd /k "%VENV_PATH% && uvicorn src.trading_strategy_controller:app --reload --port 8002 %DEBUG_FLAGS%"
+echo [3/5] Starting Momentum Strategy Controller (Port 8002)...
+start "Momentum Strategy" cmd /k "%VENV_PATH% && uvicorn src.strategies.momentum_strategy_controller:app --reload --port 8002 %DEBUG_FLAGS%"
 timeout /t 2 /nobreak > nul
 
 echo [4/5] Starting Paper Trading Controller (Port 8003)...
 start "Paper Trading Controller" cmd /k "%VENV_PATH% && uvicorn src.paper_trading_controller:app --reload --port 8003 %DEBUG_FLAGS%"
 timeout /t 2 /nobreak > nul
 
-echo [5/5] Starting Main Trading Controller (Port 8004)...
-start "Main Trading Controller" cmd /k "%VENV_PATH% && uvicorn src.trading_controller:app --reload --port 8004 %DEBUG_FLAGS%"
+echo [5/5] Starting Portfolio Orchestrator (Port 8004)...
+start "Portfolio Orchestrator" cmd /k "%VENV_PATH% && uvicorn src.portfolio_orchestrator:app --reload --port 8004 %DEBUG_FLAGS%"
 timeout /t 2 /nobreak > nul
 
 echo.
@@ -79,11 +79,11 @@ if /i "%DEBUG_MODE%"=="y" (
     echo.
 )
 echo Server URLs:
-echo - Events Controller:    http://localhost:8000
-echo - Markets Controller:   http://localhost:8001  
-echo - Strategy Controller:  http://localhost:8002
-echo - Paper Trading:        http://localhost:8003
-echo - Main Controller:      http://localhost:8004
+echo - Events Controller:       http://localhost:8000
+echo - Markets Controller:      http://localhost:8001
+echo - Momentum Strategy:       http://localhost:8002
+echo - Paper Trading:           http://localhost:8003
+echo - Portfolio Orchestrator:  http://localhost:8004
 echo.
 echo Wait a few seconds for all servers to fully start,
 echo then you can run your paper trading demo!

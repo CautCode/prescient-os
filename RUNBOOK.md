@@ -30,21 +30,21 @@ The system runs **5 independent FastAPI servers** that communicate via HTTP:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    MAIN TRADING CONTROLLER                   │
+│                 PORTFOLIO ORCHESTRATOR                       │
 │                    (Port 8004)                               │
-│         Orchestrates the entire trading cycle                │
+│    Routes portfolios to their strategy controllers           │
 └─────────────────────────────────────────────────────────────┘
                               │
            ┌──────────────────┼──────────────────┐
            │                  │                  │
            ▼                  ▼                  ▼
 ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│ Events          │  │ Markets         │  │ Strategy        │
-│ Controller      │  │ Controller      │  │ Controller      │
+│ Events          │  │ Markets         │  │ Momentum        │
+│ Controller      │  │ Controller      │  │ Strategy        │
 │ (Port 8000)     │  │ (Port 8001)     │  │ (Port 8002)     │
 │                 │  │                 │  │                 │
-│ Fetches &       │  │ Filters markets │  │ Generates       │
-│ filters events  │  │ from events     │  │ buy/sell signals│
+│ Fetches events  │  │ Exports markets │  │ Filters &       │
+│ from Polymarket │  │ from events     │  │ generates signals│
 └─────────────────┘  └─────────────────┘  └─────────────────┘
                               │
                               ▼
@@ -57,6 +57,12 @@ The system runs **5 independent FastAPI servers** that communicate via HTTP:
                     │ & manages P&L   │
                     └─────────────────┘
 ```
+
+**Key Architecture Change**: The system now uses a **strategy-centric** architecture where:
+- Each portfolio has a `strategy_type` (e.g., 'momentum', 'mean_reversion')
+- Strategy controllers handle ALL filtering and signal generation logic
+- The orchestrator simply routes portfolios to their appropriate strategy
+- Multiple strategies can run simultaneously on different ports
 
 ### Portfolio Architecture (NEW!)
 
@@ -216,18 +222,27 @@ print(f"✅ Created portfolio ID: {portfolio_id}")
 
 ### Step 2: Verify All Services Are Online
 
-Visit the main controller status endpoint:
+Visit the orchestrator status endpoint:
 
-**Browser**: http://localhost:8004/trading/status
+**Browser**: http://localhost:8004/orchestrator/status
 
 You should see:
 ```json
 {
-  "system_health": "healthy",
-  "health_summary": {
-    "online_components": 4,
-    "total_components": 4,
-    "health_percentage": 100.0
+  "orchestrator": "online",
+  "overall_health": "healthy",
+  "strategy_controllers": {
+    "momentum": {
+      "status": "online",
+      "port": 8002
+    }
+  },
+  "paper_trading_controller": {
+    "status": "online"
+  },
+  "portfolios": {
+    "total": 1,
+    "active": 1
   }
 }
 ```
@@ -292,46 +307,66 @@ A complete trading cycle executes these steps:
 6. **Update Prices** - Calculate current P&L on open positions
 7. **Create Snapshot** - Save daily portfolio state for history
 
-### Option A: Run Full Automated Cycle (Recommended)
+### Option A: Run Portfolio-Specific Cycle (Recommended)
 
 **Browser**: Visit http://localhost:8004/docs
 
-1. Find `GET /trading/run-full-cycle`
+1. Find `POST /orchestrator/run-portfolio-cycle`
 2. Click "Try it out"
-3. Use default parameters or customize:
-   ```
-   event_min_liquidity: 10000      # Minimum $10k event liquidity
-   event_min_volume: 50000          # Minimum $50k event volume
-   min_liquidity: 10000             # Minimum $10k market liquidity
-   min_volume: 50000                # Minimum $50k market volume
-   min_market_conviction: 0.5       # Markets with 50%+ probability
-   max_market_conviction: 0.6       # But not >60% (too risky)
-   ```
+3. Enter your `portfolio_id` (e.g., `1`)
 4. Click "Execute"
+
+**What Happens**:
+- Orchestrator loads portfolio and determines its strategy (e.g., 'momentum')
+- Routes to appropriate strategy controller
+- Strategy controller handles ALL filtering and signal generation
+- Signals are executed via paper trading controller
+- Prices are updated and portfolio snapshot is created
 
 **Expected Results**:
 - Cycle takes 30-90 seconds depending on Polymarket API response
-- Returns detailed results for all 7 steps
-- Check `execution_summary` to see how many trades executed
+- Returns detailed results including signals generated and trades executed
+- Check `summary` section for quick overview
 
-### Option B: Run Portfolio-Specific Cycle
+### Option B: Run All Active Portfolios
 
-If you have multiple portfolios and want to trade only one:
-
-**Browser**: http://localhost:8004/docs
-
-1. Find `GET /trading/run-portfolio-cycle`
-2. Enter `portfolio_id` (e.g., `1`)
-3. Set filtering parameters (same as above)
-4. Click "Execute"
-
-### Option C: Run All Portfolios
+If you have multiple portfolios:
 
 **Browser**: http://localhost:8004/docs
 
-1. Find `GET /trading/run-all-portfolios`
-2. This runs cycles for ALL active portfolios
-3. Markets are fetched once (shared), then each portfolio trades independently
+1. Find `POST /orchestrator/run-all-portfolios`
+2. Click "Try it out"
+3. Click "Execute"
+
+**What Happens**:
+- Runs cycle for ALL active portfolios
+- Each portfolio uses its own strategy and configuration
+- All execute independently
+
+### Configuring Strategy Parameters
+
+Each portfolio has its own `strategy_config` that controls filtering behavior. To customize:
+
+**Via API** (http://localhost:8003/docs):
+1. Find `PUT /portfolios/{portfolio_id}/update`
+2. Update the `strategy_config` field:
+   ```json
+   {
+     "strategy_config": {
+       "event_min_liquidity": 10000,
+       "event_min_volume": 50000,
+       "market_min_liquidity": 10000,
+       "market_min_volume": 50000,
+       "market_min_conviction": 0.50,
+       "market_max_conviction": 0.60,
+       "min_confidence": 0.75,
+       "max_positions": 10,
+       "trade_amount": 100
+     }
+   }
+   ```
+
+The strategy controller will merge your config with its defaults.
 
 ### What Happens During a Trade?
 
@@ -598,15 +633,15 @@ start_servers.bat
 ### Morning Routine (5 minutes)
 
 - [ ] Start servers: `start_servers.bat`
-- [ ] Verify system health: http://localhost:8004/trading/status
+- [ ] Verify system health: http://localhost:8004/orchestrator/status
 - [ ] Check portfolio state: http://localhost:8003/paper-trading/portfolio
 - [ ] Review yesterday's trades: http://localhost:8003/paper-trading/trades-history
 
 ### Run Trading Cycle (2 minutes)
 
 - [ ] Visit: http://localhost:8004/docs
-- [ ] Execute: `GET /trading/run-full-cycle`
-- [ ] Review results: Check execution_summary
+- [ ] Execute: `POST /orchestrator/run-portfolio-cycle` (enter portfolio_id)
+- [ ] Review results: Check summary section
 
 ### Afternoon Check (1 minute)
 
@@ -629,7 +664,7 @@ Create a scheduled task to run the trading cycle automatically:
 1. **Create a batch file** `run_daily_cycle.bat`:
    ```batch
    @echo off
-   curl http://localhost:8004/trading/run-full-cycle > daily_cycle_log.txt
+   curl -X POST "http://localhost:8004/orchestrator/run-all-portfolios" > daily_cycle_log.txt
    ```
 
 2. **Schedule in Task Scheduler**:
@@ -664,11 +699,11 @@ Once you're comfortable with basic operations:
 ## Support & Resources
 
 ### API Documentation
-- Events: http://localhost:8000/docs
-- Markets: http://localhost:8001/docs
-- Strategy: http://localhost:8002/docs
+- Events Controller: http://localhost:8000/docs
+- Markets Controller: http://localhost:8001/docs
+- Momentum Strategy: http://localhost:8002/docs
 - Paper Trading: http://localhost:8003/docs
-- Main Controller: http://localhost:8004/docs
+- Portfolio Orchestrator: http://localhost:8004/docs
 
 ### Database Access
 ```bash

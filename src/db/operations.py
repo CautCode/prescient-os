@@ -630,13 +630,18 @@ def insert_signal(signal: Dict, portfolio_id: int = None) -> int:
         return int(inserted_id)
 
 
-def insert_signals(signals: List[Dict], portfolio_id: int = None) -> List[int]:
+def insert_signals(signals: List[Dict], portfolio_id: int = None, strategy_type: str = None) -> List[int]:
     """
     Bulk insert trading signals in a single transaction; returns list of ids
 
     Args:
         signals: List of signal data dictionaries
         portfolio_id: Portfolio ID (defaults to first active portfolio)
+        strategy_type: Strategy type that generated these signals (e.g., 'momentum', 'mean_reversion')
+                      If not provided, attempts to use strategy_type from portfolio
+
+    Returns:
+        List of inserted signal IDs
     """
     if not signals:
         return []
@@ -644,10 +649,18 @@ def insert_signals(signals: List[Dict], portfolio_id: int = None) -> List[int]:
     if portfolio_id is None:
         portfolio_id = _get_default_portfolio_id()
 
+    # If strategy_type not provided, get it from portfolio
+    if strategy_type is None:
+        portfolio = get_portfolio_state(portfolio_id)
+        strategy_type = portfolio.get('strategy_type', 'unknown')
+
     with get_db() as db:
         inserted_ids: List[int] = []
         for signal in signals:
             signal['portfolio_id'] = portfolio_id
+            # Set strategy_type if not already in signal
+            if 'strategy_type' not in signal:
+                signal['strategy_type'] = strategy_type
 
             result = db.execute(text("""
                 INSERT INTO trading_signals
@@ -661,7 +674,7 @@ def insert_signals(signals: List[Dict], portfolio_id: int = None) -> List[int]:
             """), signal)
             inserted_ids.append(int(result.scalar_one()))
         db.commit()
-        logger.info(f"Inserted {len(inserted_ids)} signals for portfolio {portfolio_id}")
+        logger.info(f"Inserted {len(inserted_ids)} signals for portfolio {portfolio_id} using strategy '{strategy_type}'")
         return inserted_ids
 
 
