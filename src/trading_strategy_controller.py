@@ -48,20 +48,21 @@ def generate_trading_signals(market_data: List[Dict]) -> List[Dict]:
             market_id = market.get('id')
             market_question = market.get('question', 'Unknown Question')
 
-            # Parse outcome prices
-            outcome_prices_str = market.get('outcomePrices', '[]')
+            # Get yes_price and no_price from database (already parsed during event export)
+            yes_price = market.get('yes_price')
+            no_price = market.get('no_price')
+
+            # Skip markets with missing price data
+            if yes_price is None or no_price is None:
+                logger.debug(f"Skipping market {market_id}: Missing price data")
+                continue
+
+            # Convert to float
             try:
-                import ast
-                outcome_prices = ast.literal_eval(outcome_prices_str)
-                if not outcome_prices or len(outcome_prices) < 2:
-                    logger.debug(f"Skipping market {market_id}: Invalid outcome prices")
-                    continue
-
-                yes_price = float(outcome_prices[0])
-                no_price = float(outcome_prices[1])
-
-            except Exception as price_error:
-                logger.debug(f"Error parsing prices for market {market_id}: {price_error}")
+                yes_price = float(yes_price)
+                no_price = float(no_price)
+            except (ValueError, TypeError) as price_error:
+                logger.debug(f"Error converting prices for market {market_id}: {price_error}")
                 continue
 
             # Apply >50% buy-most-likely strategy
@@ -180,6 +181,7 @@ async def generate_signals():
                     'market_id': s.get('market_id'),
                     'market_question': s.get('market_question'),
                     'action': s.get('action'),
+                    'strategy_type': '>50% buy strategy',
                     'target_price': float(s.get('target_price')) if s.get('target_price') is not None else None,
                     'amount': float(s.get('amount')) if s.get('amount') is not None else None,
                     'confidence': float(s.get('confidence')) if s.get('confidence') is not None else None,

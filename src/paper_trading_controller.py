@@ -266,59 +266,135 @@ async def root():
     return {"message": "Polymarket Paper Trading API is running", "timestamp": datetime.now().isoformat()}
 
 @app.get("/paper-trading/execute-signals")
-async def execute_signals():
+async def execute_signals(portfolio_id: Optional[int] = None):
     """
-    Execute all current trading signals
-    
+    Execute all current trading signals for a specific portfolio or default portfolio
+
+    Args:
+        portfolio_id: Portfolio ID (optional, defaults to first active portfolio)
+
     Returns:
         Execution results and portfolio update
     """
+    from src.db.operations import (
+        get_current_signals, get_portfolio_state, get_portfolio_positions,
+        update_portfolio, add_portfolio_position, insert_trade, mark_signal_executed
+    )
+
     try:
         logger.info("=== STARTING PAPER TRADING EXECUTION ===")
-        
-        # Step 1: Load current signals from database
-        from src.db.operations import get_current_signals
-        logger.info("Reading trading signals from database")
 
+        # Step 1: Get portfolio state from database
+        logger.info("Step 1: Loading portfolio from database...")
         try:
-            signals = get_current_signals(executed=False)  # Only get unexecuted signals
-            logger.info(f"✓ Successfully loaded {len(signals)} trading signals from database")
+            portfolio = get_portfolio_state(portfolio_id)
+            portfolio_id = portfolio['portfolio_id']  # Use the actual ID (in case None was passed)
+            logger.info(f"✓ Loaded portfolio {portfolio_id}: {portfolio['name']} with balance: ${portfolio['current_balance']:.2f}")
+        except ValueError as ve:
+            raise HTTPException(status_code=404, detail=str(ve))
+
+        # Step 2: Load current signals from database for this portfolio
+        logger.info("Step 2: Reading trading signals from database...")
+        try:
+            signals = get_current_signals(portfolio_id=portfolio_id, executed=False)
+            logger.info(f"✓ Successfully loaded {len(signals)} trading signals for portfolio {portfolio_id}")
         except Exception as read_error:
             logger.error(f"✗ Error reading signals from database: {read_error}")
             raise HTTPException(status_code=500, detail=f"Error reading signals from database: {str(read_error)}")
-        
+
         if not signals:
-            logger.warning("No trading signals found")
+            logger.warning(f"No trading signals found for portfolio {portfolio_id}")
             raise HTTPException(status_code=404, detail="No trading signals found. Please generate signals first.")
-        
-        # Step 2: Load portfolio
-        logger.info("Step 2: Loading portfolio...")
-        portfolio = load_portfolio()
-        initial_balance = portfolio['balance']
-        logger.info(f"✓ Loaded portfolio with balance: ${initial_balance:.2f}")
+
+        initial_balance = portfolio['current_balance']
         
         # Step 3: Execute trades
         logger.info("Step 3: Executing trades...")
         execution_results = []
-        executed_trades = []  # Will store tuples of (signal_id, trade)
+        executed_count = 0
+        failed_count = 0
+
+        # Create a temporary portfolio dict for execute_trade compatibility
+        portfolio_dict = {
+            'balance': portfolio['current_balance'],
+            'positions': [],
+            'total_invested': portfolio['total_invested'],
+            'trade_count': portfolio['trade_count'],
+            'total_profit_loss': portfolio['total_profit_loss']
+        }
 
         for signal in signals:
             try:
-                result = execute_trade(signal, portfolio)
+                # Check if portfolio has sufficient balance
+                trade_amount = signal.get('amount', 100)
+                if portfolio_dict['balance'] < trade_amount:
+                    logger.warning(f"Insufficient balance for signal {signal['id']}: ${portfolio_dict['balance']:.2f} < ${trade_amount}")
+                    execution_results.append({
+                        "market_id": signal['market_id'],
+                        "market_question": signal.get('market_question', 'Unknown'),
+                        "action": signal['action'],
+                        "amount": signal['amount'],
+                        "status": "failed",
+                        "reason": f"Insufficient balance: ${portfolio_dict['balance']:.2f} < ${trade_amount}"
+                    })
+                    failed_count += 1
+                    continue
+
+                # Create trade
+                trade = {
+                    "trade_id": f"trade_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{signal['market_id']}_{portfolio_id}",
+                    "timestamp": datetime.now().isoformat(),
+                    "market_id": signal['market_id'],
+                    "market_question": signal['market_question'],
+                    "action": signal['action'],
+                    "amount": trade_amount,
+                    "entry_price": signal['target_price'],
+                    "confidence": signal.get('confidence'),
+                    "reason": signal['reason'],
+                    "status": "open",
+                    "event_id": signal.get('event_id'),
+                    "event_title": signal.get('event_title'),
+                    "event_end_date": signal.get('event_end_date'),
+                    "current_pnl": 0.0,
+                    "realized_pnl": None
+                }
+
+                # Update portfolio balances
+                portfolio_dict['balance'] -= trade_amount
+                portfolio_dict['total_invested'] += trade_amount
+                portfolio_dict['trade_count'] += 1
+
+                # Save trade to database
+                insert_trade(trade, portfolio_id=portfolio_id)
+
+                # Add position to database
+                position = {
+                    "trade_id": trade["trade_id"],
+                    "market_id": signal['market_id'],
+                    "market_question": signal['market_question'],
+                    "action": signal['action'],
+                    "amount": trade_amount,
+                    "entry_price": signal['target_price'],
+                    "entry_timestamp": trade["timestamp"],
+                    "status": "open",
+                    "current_pnl": 0.0
+                }
+                add_portfolio_position(position, portfolio_id=portfolio_id)
+
+                # Mark signal as executed
+                mark_signal_executed(signal['id'], trade['trade_id'], portfolio_id=portfolio_id)
+
                 execution_results.append({
                     "market_id": signal['market_id'],
                     "market_question": signal.get('market_question', 'Unknown'),
                     "action": signal['action'],
                     "amount": signal['amount'],
-                    "status": result['status'],
-                    "reason": result['reason']
+                    "status": "executed",
+                    "reason": "Trade executed successfully"
                 })
 
-                if result['status'] == 'executed' and result['trade']:
-                    executed_trades.append((signal['id'], result['trade']))
-                    logger.debug(f"Executed: {signal['action']} {signal['market_id']} for ${signal['amount']}")
-                else:
-                    logger.debug(f"Failed: {signal['market_id']} - {result['reason']}")
+                executed_count += 1
+                logger.info(f"Executed trade {trade['trade_id']} for portfolio {portfolio_id}")
 
             except Exception as trade_error:
                 logger.warning(f"Error executing trade for market {signal.get('market_id', 'unknown')}: {trade_error}")
@@ -330,45 +406,34 @@ async def execute_signals():
                     "status": "error",
                     "reason": str(trade_error)
                 })
-        
-        # Step 4: Save portfolio
-        logger.info("Step 4: Saving updated portfolio...")
+                failed_count += 1
+
+        # Step 4: Update portfolio in database
+        logger.info("Step 4: Updating portfolio in database...")
         try:
-            save_portfolio(portfolio)
-            logger.info(f"✓ Portfolio saved. New balance: ${portfolio['balance']:.2f}")
+            update_portfolio(portfolio_id, {
+                'current_balance': portfolio_dict['balance'],
+                'total_invested': portfolio_dict['total_invested'],
+                'trade_count': portfolio_dict['trade_count'],
+                'last_trade_at': datetime.now()
+            })
+            logger.info(f"✓ Portfolio {portfolio_id} saved. New balance: ${portfolio_dict['balance']:.2f}")
         except Exception as save_error:
             logger.error(f"✗ Error saving portfolio: {save_error}")
             raise HTTPException(status_code=500, detail=f"Error saving portfolio: {str(save_error)}")
         
-        # Step 5: Append trades to history
-        logger.info("Step 5: Saving trades to permanent history...")
-        try:
-            for signal_id, trade in executed_trades:
-                append_trade_to_history(trade)
-                # Mark signal as executed in database after trade is saved
-                try:
-                    from src.db.operations import mark_signal_executed
-                    mark_signal_executed(signal_id, trade['trade_id'])
-                    logger.debug(f"Marked signal {signal_id} as executed with trade_id {trade['trade_id']}")
-                except Exception as mark_error:
-                    logger.warning(f"Failed to mark signal {signal_id} as executed: {mark_error}")
-            logger.info(f"✓ Appended {len(executed_trades)} trades to history")
-        except Exception as history_error:
-            logger.error(f"✗ Error saving trade history: {history_error}")
-            # Don't fail the entire operation for history save errors
-            logger.warning("Continuing despite history save error")
-        
-        # Step 6: Calculate summary
-        logger.info("Step 6: Calculating execution summary...")
-        executed_count = len(executed_trades)
-        failed_count = len([r for r in execution_results if r['status'] == 'failed'])
+        # Step 5: Calculate summary
+        logger.info("Step 5: Calculating execution summary...")
         error_count = len([r for r in execution_results if r['status'] == 'error'])
-        total_invested = sum(trade['amount'] for _, trade in executed_trades)
-        
+        total_invested = portfolio_dict['total_invested'] - portfolio['total_invested']
+
         logger.info("=== PAPER TRADING EXECUTION COMPLETED ===")
-        
+        logger.info(f"Portfolio {portfolio_id}: Executed {executed_count} trades, {failed_count} failed")
+
         return {
             "message": "Paper trading execution completed",
+            "portfolio_id": portfolio_id,
+            "portfolio_name": portfolio['name'],
             "execution_summary": {
                 "total_signals": len(signals),
                 "executed_trades": executed_count,
@@ -378,10 +443,9 @@ async def execute_signals():
             },
             "portfolio_update": {
                 "initial_balance": initial_balance,
-                "final_balance": portfolio['balance'],
+                "final_balance": portfolio_dict['balance'],
                 "amount_invested": total_invested,
-                "total_positions": len(portfolio['positions']),
-                "total_trades_count": portfolio['trade_count']
+                "total_trades_count": portfolio_dict['trade_count']
             },
             "execution_details": execution_results,
             "timestamp": datetime.now().isoformat()
@@ -397,98 +461,516 @@ async def execute_signals():
         logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.get("/paper-trading/portfolio")
-async def get_portfolio():
+@app.post("/portfolios/create")
+async def create_portfolio_endpoint(portfolio_data: Dict):
     """
-    Get current portfolio state
-    
+    Create a new portfolio
+
+    Args:
+        portfolio_data: Portfolio configuration
+
     Returns:
-        Current portfolio information
+        Created portfolio ID
+
+    Example request body:
+    {
+        "name": "Aggressive Momentum",
+        "description": "High-risk momentum strategy",
+        "strategy_type": "momentum",
+        "initial_balance": 50000.00,
+        "strategy_config": {
+            "min_confidence": 0.80,
+            "market_types": ["crypto", "politics"]
+        }
+    }
     """
+    from src.db.operations import create_portfolio
+
     try:
-        portfolio = load_portfolio()
-        
-        # Try to update P&L with current market data from database
+        # Validate required fields
+        required_fields = ['name', 'strategy_type', 'initial_balance']
+        for field in required_fields:
+            if field not in portfolio_data:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required field: {field}"
+                )
+
+        # Create portfolio
+        portfolio_id = create_portfolio(portfolio_data)
+
+        logger.info(f"Created new portfolio: {portfolio_data['name']} (ID: {portfolio_id})")
+
+        return {
+            "message": "Portfolio created successfully",
+            "portfolio_id": portfolio_id,
+            "portfolio_name": portfolio_data['name'],
+            "strategy_type": portfolio_data['strategy_type'],
+            "initial_balance": portfolio_data['initial_balance'],
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating portfolio: {e}")
+        raise HTTPException(status_code=500, detail=f"Error creating portfolio: {str(e)}")
+
+
+@app.get("/portfolios/list")
+async def list_portfolios(status: Optional[str] = None):
+    """
+    Get all portfolios, optionally filtered by status
+
+    Args:
+        status: Filter by status ('active', 'paused', 'archived'), or None for all
+
+    Returns:
+        List of all portfolios
+    """
+    from src.db.operations import get_all_portfolios
+
+    try:
+        portfolios = get_all_portfolios(status=status)
+
+        # Calculate summary statistics
+        total_value = sum(
+            p['current_balance'] + p.get('total_profit_loss', 0)
+            for p in portfolios
+        )
+        active_count = len([p for p in portfolios if p['status'] == 'active'])
+
+        return {
+            "message": f"Retrieved {len(portfolios)} portfolios",
+            "portfolios": portfolios,
+            "summary": {
+                "total_portfolios": len(portfolios),
+                "active_portfolios": active_count,
+                "total_value_all_portfolios": round(total_value, 2)
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing portfolios: {e}")
+        raise HTTPException(status_code=500, detail=f"Error listing portfolios: {str(e)}")
+
+
+@app.get("/portfolios/{portfolio_id}")
+async def get_portfolio_by_id(portfolio_id: int):
+    """
+    Get specific portfolio by ID with full details
+
+    Args:
+        portfolio_id: Portfolio ID to retrieve
+
+    Returns:
+        Portfolio details including positions
+    """
+    from src.db.operations import get_portfolio_state, get_portfolio_positions
+
+    try:
+        # Get portfolio state
+        portfolio = get_portfolio_state(portfolio_id)
+
+        # Get positions for this portfolio
+        positions = get_portfolio_positions(portfolio_id, status='open')
+
+        # Try to update P&L with current market data
         try:
             from src.db.operations import get_markets
             market_data = get_markets(filters={'is_filtered': True})
             if market_data:
-                update_portfolio_pnl(portfolio, market_data)
-                save_portfolio(portfolio)  # Save updated P&L
+                # Calculate P&L for this specific portfolio
+                portfolio_dict = {
+                    'balance': portfolio['current_balance'],
+                    'positions': positions,
+                    'total_profit_loss': portfolio['total_profit_loss']
+                }
+                update_portfolio_pnl(portfolio_dict, market_data)
+                portfolio['total_profit_loss'] = portfolio_dict['total_profit_loss']
+
+                # Save updated P&L
+                from src.db.operations import update_portfolio
+                update_portfolio(portfolio_id, {
+                    'total_profit_loss': portfolio['total_profit_loss']
+                })
         except Exception as pnl_error:
-            logger.debug(f"Could not update P&L: {pnl_error}")
-        
+            logger.debug(f"Could not update P&L for portfolio {portfolio_id}: {pnl_error}")
+
         return {
-            "message": "Current portfolio retrieved",
-            "portfolio": portfolio,
+            "message": "Portfolio retrieved successfully",
+            "portfolio": {
+                **portfolio,
+                'positions': positions
+            },
             "summary": {
-                "total_value": portfolio['balance'] + portfolio.get('total_profit_loss', 0),
-                "open_positions": len([p for p in portfolio['positions'] if p['status'] == 'open']),
+                "total_value": portfolio['current_balance'] + portfolio.get('total_profit_loss', 0),
+                "open_positions": len(positions),
                 "total_invested": portfolio['total_invested'],
                 "unrealized_pnl": portfolio.get('total_profit_loss', 0)
             },
             "timestamp": datetime.now().isoformat()
         }
-        
+
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error getting portfolio {portfolio_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting portfolio: {str(e)}")
+
+
+@app.patch("/portfolios/{portfolio_id}")
+async def update_portfolio_endpoint(portfolio_id: int, updates: Dict):
+    """
+    Update portfolio fields
+
+    Args:
+        portfolio_id: Portfolio ID to update
+        updates: Dictionary of fields to update
+
+    Returns:
+        Updated portfolio confirmation
+
+    Example request body:
+    {
+        "status": "paused",
+        "strategy_config": {
+            "min_confidence": 0.85
+        }
+    }
+    """
+    from src.db.operations import update_portfolio, get_portfolio_state
+
+    try:
+        # Verify portfolio exists
+        portfolio = get_portfolio_state(portfolio_id)
+
+        # Validate updates - don't allow changing certain fields
+        restricted_fields = ['portfolio_id', 'created_at', 'initial_balance']
+        for field in restricted_fields:
+            if field in updates:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot update restricted field: {field}"
+                )
+
+        # Update portfolio
+        update_portfolio(portfolio_id, updates)
+
+        # Get updated portfolio
+        updated_portfolio = get_portfolio_state(portfolio_id)
+
+        logger.info(f"Updated portfolio {portfolio_id}: {list(updates.keys())}")
+
+        return {
+            "message": "Portfolio updated successfully",
+            "portfolio_id": portfolio_id,
+            "updated_fields": list(updates.keys()),
+            "portfolio": updated_portfolio,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating portfolio {portfolio_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error updating portfolio: {str(e)}")
+
+
+@app.post("/portfolios/{portfolio_id}/pause")
+async def pause_portfolio_endpoint(portfolio_id: int, reason: Optional[str] = None):
+    """
+    Pause a portfolio (stop trading but keep data)
+
+    Args:
+        portfolio_id: Portfolio ID to pause
+        reason: Optional reason for pausing
+
+    Returns:
+        Pause confirmation
+    """
+    from src.db.operations import pause_portfolio, get_portfolio_state
+
+    try:
+        # Verify portfolio exists
+        portfolio = get_portfolio_state(portfolio_id)
+
+        if portfolio['status'] == 'paused':
+            return {
+                "message": "Portfolio is already paused",
+                "portfolio_id": portfolio_id,
+                "portfolio_name": portfolio['name'],
+                "status": "paused",
+                "timestamp": datetime.now().isoformat()
+            }
+
+        # Pause portfolio
+        pause_portfolio(portfolio_id, reason)
+
+        logger.info(f"Paused portfolio {portfolio_id}: {reason}")
+
+        return {
+            "message": "Portfolio paused successfully",
+            "portfolio_id": portfolio_id,
+            "portfolio_name": portfolio['name'],
+            "reason": reason,
+            "status": "paused",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error pausing portfolio {portfolio_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error pausing portfolio: {str(e)}")
+
+
+@app.post("/portfolios/{portfolio_id}/resume")
+async def resume_portfolio_endpoint(portfolio_id: int):
+    """
+    Resume a paused portfolio (activate trading)
+
+    Args:
+        portfolio_id: Portfolio ID to resume
+
+    Returns:
+        Resume confirmation
+    """
+    from src.db.operations import update_portfolio, get_portfolio_state
+
+    try:
+        # Verify portfolio exists
+        portfolio = get_portfolio_state(portfolio_id)
+
+        if portfolio['status'] == 'active':
+            return {
+                "message": "Portfolio is already active",
+                "portfolio_id": portfolio_id,
+                "portfolio_name": portfolio['name'],
+                "status": "active",
+                "timestamp": datetime.now().isoformat()
+            }
+
+        # Resume portfolio
+        update_portfolio(portfolio_id, {'status': 'active'})
+
+        logger.info(f"Resumed portfolio {portfolio_id}")
+
+        return {
+            "message": "Portfolio resumed successfully",
+            "portfolio_id": portfolio_id,
+            "portfolio_name": portfolio['name'],
+            "status": "active",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error resuming portfolio {portfolio_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error resuming portfolio: {str(e)}")
+
+
+@app.get("/paper-trading/portfolio")
+async def get_portfolio(portfolio_id: Optional[int] = None):
+    """
+    Get current portfolio state from database
+
+    Args:
+        portfolio_id: Portfolio ID (optional, defaults to first active portfolio)
+
+    Returns:
+        Current portfolio information with positions
+    """
+    from src.db.operations import get_portfolio_state, get_portfolio_positions, update_portfolio
+
+    try:
+        # Get portfolio state from database
+        portfolio = get_portfolio_state(portfolio_id)
+        portfolio_id = portfolio['portfolio_id']  # Use actual ID in case None was passed
+
+        # Get positions for this portfolio
+        positions = get_portfolio_positions(portfolio_id, status='open')
+
+        # Try to update P&L with current market data from database
+        try:
+            from src.db.operations import get_markets
+            market_data = get_markets(filters={'is_filtered': True})
+            if market_data:
+                # Calculate P&L for this specific portfolio
+                portfolio_dict = {
+                    'balance': portfolio['current_balance'],
+                    'positions': positions,
+                    'total_profit_loss': portfolio['total_profit_loss']
+                }
+                update_portfolio_pnl(portfolio_dict, market_data)
+                portfolio['total_profit_loss'] = portfolio_dict['total_profit_loss']
+
+                # Save updated P&L
+                update_portfolio(portfolio_id, {
+                    'total_profit_loss': portfolio['total_profit_loss'],
+                    'last_price_update': datetime.now()
+                })
+        except Exception as pnl_error:
+            logger.debug(f"Could not update P&L for portfolio {portfolio_id}: {pnl_error}")
+
+        return {
+            "message": "Portfolio retrieved from database",
+            "portfolio_id": portfolio_id,
+            "portfolio": {
+                **portfolio,
+                'positions': positions
+            },
+            "summary": {
+                "total_value": portfolio['current_balance'] + portfolio.get('total_profit_loss', 0),
+                "open_positions": len(positions),
+                "total_invested": portfolio['total_invested'],
+                "unrealized_pnl": portfolio.get('total_profit_loss', 0)
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
         logger.error(f"Error getting portfolio: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting portfolio: {str(e)}")
 
 @app.get("/paper-trading/trades-history")
-async def get_trades_history():
+async def get_trades_history(portfolio_id: Optional[int] = None, limit: Optional[int] = None):
     """
     Get complete trading history from database
 
+    Args:
+        portfolio_id: Portfolio ID (optional, defaults to first active portfolio)
+        limit: Maximum number of trades to return (optional)
+
     Returns:
-        All executed trades history
+        All executed trades history for the specified portfolio
     """
-    from src.db.operations import get_trades
+    from src.db.operations import get_trades, get_portfolio_state
 
     try:
-        trades_history = get_trades()
+        # Get portfolio info if portfolio_id specified
+        portfolio_name = None
+        if portfolio_id is not None:
+            try:
+                portfolio = get_portfolio_state(portfolio_id)
+                portfolio_name = portfolio['name']
+            except ValueError:
+                raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} not found")
 
-        return {
+        # Get trades for this portfolio
+        trades_history = get_trades(portfolio_id=portfolio_id, limit=limit)
+
+        response = {
             "message": "Trading history retrieved from database",
             "trades_count": len(trades_history),
             "trades": trades_history,
             "timestamp": datetime.now().isoformat()
         }
 
+        if portfolio_id is not None:
+            response["portfolio_id"] = portfolio_id
+            response["portfolio_name"] = portfolio_name
+
+        if limit:
+            response["limit"] = limit
+
+        return response
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting trades history from database: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting trades history: {str(e)}")
 
-@app.get("/paper-trading/update-prices")
-async def update_prices():
+@app.get("/price-updater/update")
+async def update_portfolio_prices(portfolio_id: Optional[int] = None):
     """
-    Manually trigger price update for open positions
+    Manually trigger price update for one portfolio or all active portfolios
+
+    Args:
+        portfolio_id: Portfolio ID to update (None = update all active portfolios)
 
     Returns:
         Price update result
     """
     try:
         updater = get_price_updater()
-        if updater:
-            logger.info("Manual price update triggered")
-            updater.update_open_positions_prices()
+        if not updater:
+            raise HTTPException(status_code=503, detail="Price updater not running")
+
+        if portfolio_id is not None:
+            # Update specific portfolio
+            from src.db.operations import get_portfolio_state
+            try:
+                portfolio = get_portfolio_state(portfolio_id)
+                logger.info(f"Manual price update triggered for portfolio {portfolio_id}: {portfolio['name']}")
+            except ValueError:
+                raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} not found")
+
+            updater.update_open_positions_prices(portfolio_id=portfolio_id)
 
             # Get updated portfolio
-            portfolio = load_portfolio()
+            portfolio = get_portfolio_state(portfolio_id)
 
             return {
-                "message": "Price update completed",
+                "message": f"Price update completed for portfolio {portfolio_id}",
+                "portfolio_id": portfolio_id,
+                "portfolio_name": portfolio['name'],
                 "portfolio_pnl": portfolio.get('total_profit_loss', 0),
-                "open_positions": len([p for p in portfolio.get('positions', []) if p.get('status') == 'open']),
                 "last_price_update": portfolio.get('last_price_update'),
                 "timestamp": datetime.now().isoformat()
             }
         else:
-            raise HTTPException(status_code=503, detail="Price updater not running")
+            # Update all active portfolios
+            from src.db.operations import get_all_portfolios
+            portfolios = get_all_portfolios(status='active')
+
+            logger.info(f"Manual price update triggered for {len(portfolios)} active portfolios")
+            updater.update_open_positions_prices()  # Updates all
+
+            # Get summary of all portfolios
+            portfolio_summaries = []
+            for p in portfolios:
+                portfolio_summaries.append({
+                    'portfolio_id': p['portfolio_id'],
+                    'name': p['name'],
+                    'total_pnl': p.get('total_profit_loss', 0)
+                })
+
+            return {
+                "message": f"Price update completed for {len(portfolios)} active portfolios",
+                "portfolios_updated": len(portfolios),
+                "portfolio_summaries": portfolio_summaries,
+                "timestamp": datetime.now().isoformat()
+            }
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error updating prices: {e}")
         raise HTTPException(status_code=500, detail=f"Error updating prices: {str(e)}")
+
+
+@app.get("/paper-trading/update-prices")
+async def update_prices(portfolio_id: Optional[int] = None):
+    """
+    DEPRECATED: Use /price-updater/update instead
+    Manually trigger price update for open positions in a portfolio
+
+    Args:
+        portfolio_id: Portfolio ID (optional, defaults to first active portfolio)
+
+    Returns:
+        Price update result
+    """
+    logger.warning("DEPRECATED: /paper-trading/update-prices is deprecated, use /price-updater/update instead")
+    return await update_portfolio_prices(portfolio_id=portfolio_id)
 
 @app.get("/paper-trading/status")
 async def get_paper_trading_status():

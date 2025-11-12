@@ -260,6 +260,32 @@ def fetch_events_from_api(
         logger.error(f"Error fetching events: {e}")
         return None
 
+def parse_outcome_prices(market_data: Dict) -> tuple:
+    """
+    Parse outcomePrices from Polymarket API response and calculate market metrics.
+
+    The outcomePrices field is a JSON string containing string values of prices:
+    Example: "[\"0.6\", \"0.4\"]" where first is YES price, second is NO price
+
+    Args:
+        market_data: Market dictionary from API containing 'outcomePrices' field
+
+    Returns:
+        tuple: (yes_price, no_price, market_conviction) or (None, None, None) if parsing fails
+    """
+    outcome_prices_str = market_data.get('outcomePrices', '[]')
+    try:
+        import ast
+        outcome_prices = ast.literal_eval(outcome_prices_str)
+        if outcome_prices and len(outcome_prices) >= 2:
+            yes_price = float(outcome_prices[0])
+            no_price = float(outcome_prices[1])
+            market_conviction = abs(yes_price - no_price)
+            return yes_price, no_price, market_conviction
+    except Exception as e:
+        logger.warning(f"Error parsing outcomePrices '{outcome_prices_str}': {e}")
+    return None, None, None
+
 # API Endpoints
 @app.get("/")
 async def root():
@@ -384,7 +410,40 @@ async def export_all_active_events_db():
             else:
                 event['days_until_end'] = None
 
-        # Save to database
+        # Extract and save markets BEFORE upserting events
+        logger.info("Extracting markets from events...")
+        all_markets = []
+        for event in all_events:
+            event_markets = event.get('markets', [])
+            for market in event_markets:
+                # Parse prices from outcomePrices field in API response
+                yes_price, no_price, market_conviction = parse_outcome_prices(market)
+
+                market_with_context = {
+                    'id': market.get('id'),
+                    'question': market.get('question'),
+                    'event_id': event.get('id'),
+                    'event_title': event.get('title'),
+                    'event_end_date': event.get('endDate'),
+                    'liquidity': market.get('liquidity', 0),
+                    'volume': market.get('volume', 0),
+                    'volume24hr': market.get('volume24hr', 0),
+                    'yes_price': yes_price,
+                    'no_price': no_price,
+                    'market_conviction': market_conviction,
+                    'is_filtered': False
+                }
+                all_markets.append(market_with_context)
+
+        logger.info(f"Extracted {len(all_markets)} markets from {len(all_events)} events")
+
+        # Save markets to database
+        if all_markets:
+            from src.db.operations import upsert_markets
+            upsert_markets(all_markets)
+            logger.info(f"Successfully saved {len(all_markets)} markets to database")
+
+        # Save events to database
         upsert_events(all_events)
 
         logger.info(f"Successfully exported {len(all_events)} events to database")

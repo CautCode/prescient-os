@@ -29,178 +29,453 @@ def _json_default_serializer(obj):
 # PORTFOLIO OPERATIONS
 # ============================================================================
 
-def get_portfolio_state() -> Dict:
-    """Get current portfolio state from database"""
+def _get_default_portfolio_id() -> int:
+    """
+    Get the default portfolio ID (first active portfolio)
+    Used for backward compatibility when portfolio_id not specified
+    """
     with get_db() as db:
         result = db.execute(text("""
-            SELECT balance, total_invested, total_profit_loss, trade_count,
-                   created_at, last_updated
-            FROM portfolio_state
-            WHERE id = 1
+            SELECT portfolio_id FROM portfolios
+            WHERE status = 'active'
+            ORDER BY portfolio_id ASC
+            LIMIT 1
         """)).fetchone()
 
         if not result:
-            # Initialize default portfolio on first run
-            default_portfolio = {
-                'id': 1,
-                'balance': 10000.0,
-                'total_invested': 0.0,
-                'total_profit_loss': 0.0,
-                'trade_count': 0,
-                'created_at': datetime.now(),
-                'last_updated': datetime.now()
+            raise ValueError("No active portfolios found")
+
+        return int(result[0])
+
+
+def create_portfolio(portfolio_data: Dict) -> int:
+    """
+    Create a new portfolio
+
+    Args:
+        portfolio_data: Dictionary with portfolio configuration
+
+    Returns:
+        Created portfolio_id
+
+    Example:
+        portfolio_id = create_portfolio({
+            'name': 'Momentum Strategy',
+            'description': 'High-confidence momentum trades',
+            'strategy_type': 'momentum',
+            'initial_balance': 50000,
+            'current_balance': 50000,
+            'strategy_config': {
+                'min_confidence': 0.80,
+                'market_types': ['politics']
             }
-            db.execute(text("""
-                INSERT INTO portfolio_state
-                (id, balance, total_invested, total_profit_loss, trade_count, created_at, last_updated)
-                VALUES (:id, :balance, :total_invested, :total_profit_loss, :trade_count, :created_at, :last_updated)
-            """), default_portfolio)
-            db.commit()
-            return default_portfolio
+        })
+    """
+    with get_db() as db:
+        result = db.execute(text("""
+            INSERT INTO portfolios
+            (name, description, strategy_type, initial_balance, current_balance,
+             strategy_config, status)
+            VALUES (:name, :description, :strategy_type, :initial_balance, :current_balance,
+                    CAST(:strategy_config AS jsonb), 'active')
+            RETURNING portfolio_id
+        """), {
+            'name': portfolio_data['name'],
+            'description': portfolio_data.get('description', ''),
+            'strategy_type': portfolio_data['strategy_type'],
+            'initial_balance': portfolio_data['initial_balance'],
+            'current_balance': portfolio_data.get('current_balance', portfolio_data['initial_balance']),
+            'strategy_config': json.dumps(portfolio_data.get('strategy_config', {}))
+        })
+        portfolio_id = result.scalar_one()
+        db.commit()
+        logger.info(f"Created portfolio {portfolio_id}: {portfolio_data['name']}")
+        return int(portfolio_id)
+
+
+def get_portfolio_state(portfolio_id: int = None) -> Dict:
+    """
+    Get portfolio state for specific portfolio or default if not specified
+
+    Args:
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+
+    Returns:
+        Portfolio state dictionary
+    """
+    if portfolio_id is None:
+        # Get first active portfolio as default
+        portfolio_id = _get_default_portfolio_id()
+
+    with get_db() as db:
+        result = db.execute(text("""
+            SELECT portfolio_id, name, description, strategy_type,
+                   initial_balance, current_balance, total_invested,
+                   total_profit_loss, trade_count, status, created_at,
+                   last_updated, strategy_config, last_trade_at, last_price_update
+            FROM portfolios
+            WHERE portfolio_id = :portfolio_id
+        """), {'portfolio_id': portfolio_id}).fetchone()
+
+        if not result:
+            raise ValueError(f"Portfolio {portfolio_id} not found")
 
         return {
-            'balance': float(result[0]),
-            'total_invested': float(result[1]),
-            'total_profit_loss': float(result[2]),
-            'trade_count': int(result[3]),
-            'created_at': result[4],
-            'last_updated': result[5]
+            'portfolio_id': result[0],
+            'name': result[1],
+            'description': result[2],
+            'strategy_type': result[3],
+            'initial_balance': float(result[4]),
+            'current_balance': float(result[5]),
+            'total_invested': float(result[6]),
+            'total_profit_loss': float(result[7]),
+            'trade_count': int(result[8]),
+            'status': result[9],
+            'created_at': result[10],
+            'last_updated': result[11],
+            'strategy_config': result[12] or {},
+            'last_trade_at': result[13],
+            'last_price_update': result[14]
         }
 
 
-def upsert_portfolio_state(portfolio: Dict):
-    """Update or insert portfolio state"""
+def get_all_portfolios(status: str = None) -> List[Dict]:
+    """
+    Get all portfolios, optionally filtered by status
+
+    Args:
+        status: Filter by status ('active', 'paused', 'archived'), or None for all
+
+    Returns:
+        List of portfolio dictionaries
+    """
+    with get_db() as db:
+        query = """
+            SELECT portfolio_id, name, description, strategy_type,
+                   initial_balance, current_balance, total_invested,
+                   total_profit_loss, trade_count, status, created_at,
+                   last_updated, strategy_config, last_trade_at, last_price_update
+            FROM portfolios
+        """
+
+        params = {}
+        if status:
+            query += " WHERE status = :status"
+            params['status'] = status
+
+        query += " ORDER BY portfolio_id ASC"
+
+        results = db.execute(text(query), params).fetchall()
+
+        portfolios = []
+        for row in results:
+            portfolios.append({
+                'portfolio_id': row[0],
+                'name': row[1],
+                'description': row[2],
+                'strategy_type': row[3],
+                'initial_balance': float(row[4]),
+                'current_balance': float(row[5]),
+                'total_invested': float(row[6]),
+                'total_profit_loss': float(row[7]),
+                'trade_count': int(row[8]),
+                'status': row[9],
+                'created_at': row[10],
+                'last_updated': row[11],
+                'strategy_config': row[12] or {},
+                'last_trade_at': row[13],
+                'last_price_update': row[14]
+            })
+
+        return portfolios
+
+
+def update_portfolio(portfolio_id: int, updates: Dict):
+    """
+    Update portfolio fields
+
+    Args:
+        portfolio_id: Portfolio to update
+        updates: Dictionary of fields to update
+
+    Example:
+        update_portfolio(1, {
+            'current_balance': 9500.00,
+            'total_invested': 500.00,
+            'trade_count': 1,
+            'status': 'active'
+        })
+    """
+    with get_db() as db:
+        # Build SET clause dynamically from updates dict
+        set_clauses = [f"{key} = :{key}" for key in updates.keys()]
+        set_clauses.append("last_updated = NOW()")
+        set_clause = ", ".join(set_clauses)
+
+        query = f"""
+            UPDATE portfolios
+            SET {set_clause}
+            WHERE portfolio_id = :portfolio_id
+        """
+
+        updates['portfolio_id'] = portfolio_id
+
+        # Handle JSONB fields
+        if 'strategy_config' in updates and isinstance(updates['strategy_config'], dict):
+            updates['strategy_config'] = json.dumps(updates['strategy_config'])
+
+        db.execute(text(query), updates)
+        db.commit()
+        logger.debug(f"Updated portfolio {portfolio_id}: {list(updates.keys())}")
+
+
+def pause_portfolio(portfolio_id: int, reason: str = None):
+    """Pause a portfolio (stop trading but keep data)"""
+    update_portfolio(portfolio_id, {'status': 'paused'})
+    logger.info(f"Paused portfolio {portfolio_id}: {reason}")
+
+
+def archive_portfolio(portfolio_id: int, reason: str = None):
+    """Archive a portfolio (historical data only, no trading)"""
+    update_portfolio(portfolio_id, {'status': 'archived'})
+    logger.info(f"Archived portfolio {portfolio_id}: {reason}")
+
+
+def delete_portfolio(portfolio_id: int):
+    """
+    Delete a portfolio and all associated data (CASCADE)
+    WARNING: This is destructive and permanent
+    """
     with get_db() as db:
         db.execute(text("""
-            INSERT INTO portfolio_state
-            (id, balance, total_invested, total_profit_loss, trade_count, created_at, last_updated)
-            VALUES (1, :balance, :total_invested, :total_profit_loss, :trade_count,
-                    :created_at, NOW())
-            ON CONFLICT (id) DO UPDATE SET
-                balance = EXCLUDED.balance,
-                total_invested = EXCLUDED.total_invested,
-                total_profit_loss = EXCLUDED.total_profit_loss,
-                trade_count = EXCLUDED.trade_count,
-                last_updated = NOW()
-        """), {
-            'balance': portfolio['balance'],
+            DELETE FROM portfolios WHERE portfolio_id = :portfolio_id
+        """), {'portfolio_id': portfolio_id})
+        db.commit()
+        logger.warning(f"DELETED portfolio {portfolio_id} and all associated data")
+
+
+# ============================================================================
+# LEGACY PORTFOLIO OPERATIONS (for backward compatibility during migration)
+# ============================================================================
+
+def upsert_portfolio_state(portfolio: Dict):
+    """
+    DEPRECATED: Legacy function for backward compatibility
+    Use update_portfolio() instead
+    """
+    logger.warning("upsert_portfolio_state is deprecated, use update_portfolio instead")
+    # Try to update the default portfolio
+    try:
+        portfolio_id = _get_default_portfolio_id()
+        update_portfolio(portfolio_id, {
+            'current_balance': portfolio.get('balance', portfolio.get('current_balance')),
             'total_invested': portfolio['total_invested'],
             'total_profit_loss': portfolio['total_profit_loss'],
-            'trade_count': portfolio['trade_count'],
-            'created_at': portfolio.get('created_at', datetime.now())
+            'trade_count': portfolio['trade_count']
         })
-        db.commit()
+    except ValueError:
+        logger.error("No default portfolio found for legacy upsert_portfolio_state")
 
 
-def get_portfolio_positions(status: str = 'open') -> List[Dict]:
-    """Get portfolio positions by status"""
+def get_portfolio_positions(portfolio_id: int = None, status: str = 'open') -> List[Dict]:
+    """
+    Get portfolio positions by portfolio and status
+
+    Args:
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+        status: Position status filter ('open', 'closed', etc.)
+    """
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
+
     with get_db() as db:
         results = db.execute(text("""
-            SELECT trade_id, market_id, market_question, action, amount,
+            SELECT portfolio_id, trade_id, market_id, market_question, action, amount,
                    entry_price, entry_timestamp, status, current_pnl,
                    realized_pnl, exit_price, exit_timestamp
             FROM portfolio_positions
-            WHERE status = :status
+            WHERE portfolio_id = :portfolio_id AND status = :status
             ORDER BY entry_timestamp DESC
-        """), {'status': status}).fetchall()
+        """), {'portfolio_id': portfolio_id, 'status': status}).fetchall()
 
         positions = []
         for row in results:
             positions.append({
-                'trade_id': row[0],
-                'market_id': row[1],
-                'market_question': row[2],
-                'action': row[3],
-                'amount': float(row[4]),
-                'entry_price': float(row[5]),
-                'entry_timestamp': row[6].isoformat() if row[6] else None,
-                'status': row[7],
-                'current_pnl': float(row[8]) if row[8] else 0.0,
-                'realized_pnl': float(row[9]) if row[9] else None,
-                'exit_price': float(row[10]) if row[10] else None,
-                'exit_timestamp': row[11].isoformat() if row[11] else None
+                'portfolio_id': row[0],
+                'trade_id': row[1],
+                'market_id': row[2],
+                'market_question': row[3],
+                'action': row[4],
+                'amount': float(row[5]),
+                'entry_price': float(row[6]),
+                'entry_timestamp': row[7].isoformat() if row[7] else None,
+                'status': row[8],
+                'current_pnl': float(row[9]) if row[9] else 0.0,
+                'realized_pnl': float(row[10]) if row[10] else None,
+                'exit_price': float(row[11]) if row[11] else None,
+                'exit_timestamp': row[12].isoformat() if row[12] else None
             })
 
         return positions
 
 
-def add_portfolio_position(position: Dict):
-    """Add a new position to portfolio"""
+def add_portfolio_position(position: Dict, portfolio_id: int = None):
+    """
+    Add a new position to portfolio
+
+    Args:
+        position: Position data dictionary
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+    """
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
+
+    position['portfolio_id'] = portfolio_id
+
     with get_db() as db:
         db.execute(text("""
             INSERT INTO portfolio_positions
-            (trade_id, market_id, market_question, action, amount, entry_price,
+            (portfolio_id, trade_id, market_id, market_question, action, amount, entry_price,
              entry_timestamp, status, current_pnl)
-            VALUES (:trade_id, :market_id, :market_question, :action, :amount,
+            VALUES (:portfolio_id, :trade_id, :market_id, :market_question, :action, :amount,
                     :entry_price, :entry_timestamp, :status, :current_pnl)
         """), position)
         db.commit()
+        logger.debug(f"Added position to portfolio {portfolio_id}: {position['trade_id']}")
 
 
-def update_portfolio_position(trade_id: str, updates: Dict):
-    """Update a portfolio position"""
+def update_portfolio_position(trade_id: str, updates: Dict, portfolio_id: int = None):
+    """
+    Update a portfolio position
+
+    Args:
+        trade_id: Trade ID to update
+        updates: Dictionary of fields to update
+        portfolio_id: Portfolio ID (optional, for additional safety)
+    """
     with get_db() as db:
         set_clause = ", ".join([f"{key} = :{key}" for key in updates.keys()])
+
+        # Build WHERE clause
+        where_clause = "trade_id = :trade_id"
+        if portfolio_id is not None:
+            where_clause += " AND portfolio_id = :portfolio_id"
+            updates['portfolio_id'] = portfolio_id
+
         query = f"""
             UPDATE portfolio_positions
             SET {set_clause}
-            WHERE trade_id = :trade_id
+            WHERE {where_clause}
         """
         updates['trade_id'] = trade_id
         db.execute(text(query), updates)
         db.commit()
+        logger.debug(f"Updated position {trade_id} in portfolio {portfolio_id}")
 
 
-def close_portfolio_position(trade_id: str, exit_price: float, realized_pnl: float):
-    """Close a portfolio position"""
+def close_portfolio_position(trade_id: str, exit_price: float, realized_pnl: float, portfolio_id: int = None):
+    """
+    Close a portfolio position
+
+    Args:
+        trade_id: Trade ID to close
+        exit_price: Exit price
+        realized_pnl: Realized profit/loss
+        portfolio_id: Portfolio ID (optional, for additional safety)
+    """
     with get_db() as db:
-        db.execute(text("""
+        # Build WHERE clause
+        where_clause = "trade_id = :trade_id"
+        params = {
+            'trade_id': trade_id,
+            'exit_price': exit_price,
+            'realized_pnl': realized_pnl
+        }
+
+        if portfolio_id is not None:
+            where_clause += " AND portfolio_id = :portfolio_id"
+            params['portfolio_id'] = portfolio_id
+
+        # Update portfolio_positions table
+        query = f"""
             UPDATE portfolio_positions
             SET status = 'closed',
                 exit_price = :exit_price,
                 exit_timestamp = NOW(),
                 realized_pnl = :realized_pnl
-            WHERE trade_id = :trade_id
-        """), {
-            'trade_id': trade_id,
-            'exit_price': exit_price,
-            'realized_pnl': realized_pnl
-        })
+            WHERE {where_clause}
+        """
+        db.execute(text(query), params)
+
+        # Also update trades table to keep in sync
+        trades_query = f"""
+            UPDATE trades
+            SET status = 'closed',
+                realized_pnl = :realized_pnl
+            WHERE {where_clause}
+        """
+        db.execute(text(trades_query), params)
+
         db.commit()
+        logger.info(f"Closed position {trade_id} in portfolio {portfolio_id}: PnL ${realized_pnl}")
 
 
 # ============================================================================
 # TRADE OPERATIONS
 # ============================================================================
 
-def insert_trade(trade: Dict):
-    """Insert a new trade into history"""
+def insert_trade(trade: Dict, portfolio_id: int = None):
+    """
+    Insert a new trade into history
+
+    Args:
+        trade: Trade data dictionary
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+    """
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
+
+    trade['portfolio_id'] = portfolio_id
+
     with get_db() as db:
         db.execute(text("""
             INSERT INTO trades
-            (trade_id, timestamp, market_id, market_question, action, amount,
+            (portfolio_id, trade_id, timestamp, market_id, market_question, action, amount,
              entry_price, confidence, reason, status, event_id, event_title,
              event_end_date, current_pnl, realized_pnl)
-            VALUES (:trade_id, :timestamp, :market_id, :market_question, :action,
+            VALUES (:portfolio_id, :trade_id, :timestamp, :market_id, :market_question, :action,
                     :amount, :entry_price, :confidence, :reason, :status,
                     :event_id, :event_title, :event_end_date, :current_pnl, :realized_pnl)
         """), trade)
         db.commit()
+        logger.info(f"Inserted trade {trade['trade_id']} for portfolio {portfolio_id}")
 
 
-def get_trades(limit: int = None, status: str = None) -> List[Dict]:
-    """Get trade history with optional filters"""
+def get_trades(portfolio_id: int = None, limit: int = None, status: str = None) -> List[Dict]:
+    """
+    Get trade history with optional filters
+
+    Args:
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+        limit: Maximum number of trades to return
+        status: Filter by trade status
+    """
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
+
     with get_db() as db:
         query = """
-            SELECT trade_id, timestamp, market_id, market_question, action, amount,
+            SELECT portfolio_id, trade_id, timestamp, market_id, market_question, action, amount,
                    entry_price, confidence, reason, status, event_id, event_title,
                    event_end_date, current_pnl, realized_pnl
             FROM trades
+            WHERE portfolio_id = :portfolio_id
         """
 
-        params = {}
+        params = {'portfolio_id': portfolio_id}
+
         if status:
-            query += " WHERE status = :status"
+            query += " AND status = :status"
             params['status'] = status
 
         query += " ORDER BY timestamp DESC"
@@ -214,142 +489,210 @@ def get_trades(limit: int = None, status: str = None) -> List[Dict]:
         trades = []
         for row in results:
             trades.append({
-                'trade_id': row[0],
-                'timestamp': row[1].isoformat() if row[1] else None,
-                'market_id': row[2],
-                'market_question': row[3],
-                'action': row[4],
-                'amount': float(row[5]),
-                'entry_price': float(row[6]),
-                'confidence': float(row[7]) if row[7] is not None else 0.0,
-                'reason': row[8],
-                'status': row[9],
-                'event_id': row[10],
-                'event_title': row[11],
-                'event_end_date': row[12].isoformat() if row[12] else None,
-                'current_pnl': float(row[13]) if row[13] else 0.0,
-                'realized_pnl': float(row[14]) if row[14] else None
+                'portfolio_id': row[0],
+                'trade_id': row[1],
+                'timestamp': row[2].isoformat() if row[2] else None,
+                'market_id': row[3],
+                'market_question': row[4],
+                'action': row[5],
+                'amount': float(row[6]),
+                'entry_price': float(row[7]),
+                'confidence': float(row[8]) if row[8] is not None else 0.0,
+                'reason': row[9],
+                'status': row[10],
+                'event_id': row[11],
+                'event_title': row[12],
+                'event_end_date': row[13].isoformat() if row[13] else None,
+                'current_pnl': float(row[14]) if row[14] else 0.0,
+                'realized_pnl': float(row[15]) if row[15] else None
             })
 
         return trades
 
 
-def get_trade_by_id(trade_id: str) -> Optional[Dict]:
-    """Get a specific trade by ID"""
+def get_trade_by_id(trade_id: str, portfolio_id: int = None) -> Optional[Dict]:
+    """
+    Get a specific trade by ID
+
+    Args:
+        trade_id: Trade ID
+        portfolio_id: Portfolio ID (optional, for additional filtering)
+    """
     with get_db() as db:
-        result = db.execute(text("""
-            SELECT trade_id, timestamp, market_id, market_question, action, amount,
+        query = """
+            SELECT portfolio_id, trade_id, timestamp, market_id, market_question, action, amount,
                    entry_price, confidence, reason, status, event_id, event_title,
                    event_end_date, current_pnl, realized_pnl
             FROM trades
             WHERE trade_id = :trade_id
-        """), {'trade_id': trade_id}).fetchone()
+        """
+
+        params = {'trade_id': trade_id}
+
+        if portfolio_id is not None:
+            query += " AND portfolio_id = :portfolio_id"
+            params['portfolio_id'] = portfolio_id
+
+        result = db.execute(text(query), params).fetchone()
 
         if not result:
             return None
 
         return {
-            'trade_id': result[0],
-            'timestamp': result[1].isoformat() if result[1] else None,
-            'market_id': result[2],
-            'market_question': result[3],
-            'action': result[4],
-            'amount': float(result[5]),
-            'entry_price': float(result[6]),
-            'confidence': float(result[7]) if result[7] is not None else 0.0,
-            'reason': result[8],
-            'status': result[9],
-            'event_id': result[10],
-            'event_title': result[11],
-            'event_end_date': result[12].isoformat() if result[12] else None,
-            'current_pnl': float(result[13]) if result[13] else 0.0,
-            'realized_pnl': float(result[14]) if result[14] else None
+            'portfolio_id': result[0],
+            'trade_id': result[1],
+            'timestamp': result[2].isoformat() if result[2] else None,
+            'market_id': result[3],
+            'market_question': result[4],
+            'action': result[5],
+            'amount': float(result[6]),
+            'entry_price': float(result[7]),
+            'confidence': float(result[8]) if result[8] is not None else 0.0,
+            'reason': result[9],
+            'status': result[10],
+            'event_id': result[11],
+            'event_title': result[12],
+            'event_end_date': result[13].isoformat() if result[13] else None,
+            'current_pnl': float(result[14]) if result[14] else 0.0,
+            'realized_pnl': float(result[15]) if result[15] else None
         }
 
 
-def update_trade_status(trade_id: str, status: str, pnl: float = None):
-    """Update trade status and PnL"""
+def update_trade_status(trade_id: str, status: str, pnl: float = None, portfolio_id: int = None):
+    """
+    Update trade status and PnL
+
+    Args:
+        trade_id: Trade ID to update
+        status: New status
+        pnl: Realized PnL (optional)
+        portfolio_id: Portfolio ID (optional, for additional safety)
+    """
     with get_db() as db:
+        where_clause = "trade_id = :trade_id"
+        params = {'trade_id': trade_id, 'status': status}
+
+        if portfolio_id is not None:
+            where_clause += " AND portfolio_id = :portfolio_id"
+            params['portfolio_id'] = portfolio_id
+
         if pnl is not None:
-            db.execute(text("""
+            params['pnl'] = pnl
+            query = f"""
                 UPDATE trades
                 SET status = :status,
                     realized_pnl = :pnl
-                WHERE trade_id = :trade_id
-            """), {'trade_id': trade_id, 'status': status, 'pnl': pnl})
+                WHERE {where_clause}
+            """
         else:
-            db.execute(text("""
+            query = f"""
                 UPDATE trades
                 SET status = :status
-                WHERE trade_id = :trade_id
-            """), {'trade_id': trade_id, 'status': status})
+                WHERE {where_clause}
+            """
+
+        db.execute(text(query), params)
         db.commit()
+        logger.debug(f"Updated trade {trade_id} status to {status}")
 
 
 # ============================================================================
 # SIGNAL OPERATIONS (Phase 3)
 # ============================================================================
 
-def insert_signal(signal: Dict) -> int:
-    """Insert a single trading signal and return its generated id."""
+def insert_signal(signal: Dict, portfolio_id: int = None) -> int:
+    """
+    Insert a single trading signal and return its generated id
+
+    Args:
+        signal: Signal data dictionary
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+    """
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
+
+    signal['portfolio_id'] = portfolio_id
+
     with get_db() as db:
         result = db.execute(text("""
             INSERT INTO trading_signals
-            (timestamp, market_id, market_question, action, target_price, amount,
+            (portfolio_id, strategy_type, timestamp, market_id, market_question, action, target_price, amount,
              confidence, reason, yes_price, no_price, market_liquidity, market_volume,
              event_id, event_title, event_end_date, executed, executed_at, trade_id)
-            VALUES (:timestamp, :market_id, :market_question, :action, :target_price, :amount,
+            VALUES (:portfolio_id, :strategy_type, :timestamp, :market_id, :market_question, :action, :target_price, :amount,
                     :confidence, :reason, :yes_price, :no_price, :market_liquidity, :market_volume,
                     :event_id, :event_title, :event_end_date, :executed, :executed_at, :trade_id)
             RETURNING id
         """), signal)
         inserted_id = result.scalar_one()
         db.commit()
+        logger.debug(f"Inserted signal for portfolio {portfolio_id}: {signal.get('market_id')}")
         return int(inserted_id)
 
 
-def insert_signals(signals: List[Dict]) -> List[int]:
-    """Bulk insert trading signals in a single transaction; returns list of ids."""
+def insert_signals(signals: List[Dict], portfolio_id: int = None) -> List[int]:
+    """
+    Bulk insert trading signals in a single transaction; returns list of ids
+
+    Args:
+        signals: List of signal data dictionaries
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+    """
     if not signals:
         return []
+
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
 
     with get_db() as db:
         inserted_ids: List[int] = []
         for signal in signals:
+            signal['portfolio_id'] = portfolio_id
+
             result = db.execute(text("""
                 INSERT INTO trading_signals
-                (timestamp, market_id, market_question, action, target_price, amount,
+                (portfolio_id, strategy_type, timestamp, market_id, market_question, action, target_price, amount,
                  confidence, reason, yes_price, no_price, market_liquidity, market_volume,
                  event_id, event_title, event_end_date, executed, executed_at, trade_id)
-                VALUES (:timestamp, :market_id, :market_question, :action, :target_price, :amount,
+                VALUES (:portfolio_id, :strategy_type, :timestamp, :market_id, :market_question, :action, :target_price, :amount,
                         :confidence, :reason, :yes_price, :no_price, :market_liquidity, :market_volume,
                         :event_id, :event_title, :event_end_date, :executed, :executed_at, :trade_id)
                 RETURNING id
             """), signal)
             inserted_ids.append(int(result.scalar_one()))
         db.commit()
+        logger.info(f"Inserted {len(inserted_ids)} signals for portfolio {portfolio_id}")
         return inserted_ids
 
 
-def get_current_signals(limit: Optional[int] = None, executed: Optional[bool] = None) -> List[Dict]:
-    """Query current signals ordered by timestamp DESC with optional executed filter and limit."""
+def get_current_signals(portfolio_id: int = None, limit: Optional[int] = None, executed: Optional[bool] = None) -> List[Dict]:
+    """
+    Query current signals ordered by timestamp DESC with optional filters
+
+    Args:
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+        limit: Maximum number of signals to return
+        executed: Filter by executed status
+    """
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
+
     with get_db() as db:
         base_query = """
-            SELECT id, timestamp, market_id, market_question, action, target_price, amount,
+            SELECT id, portfolio_id, strategy_type, timestamp, market_id, market_question, action, target_price, amount,
                    confidence, reason, yes_price, no_price, market_liquidity, market_volume,
                    event_id, event_title, event_end_date, executed, executed_at, trade_id
             FROM trading_signals
         """
 
-        clauses = []
-        params: Dict = {}
+        clauses = ["portfolio_id = :portfolio_id"]
+        params: Dict = {'portfolio_id': portfolio_id}
+
         if executed is not None:
             clauses.append("executed = :executed")
             params['executed'] = executed
 
-        if clauses:
-            base_query += " WHERE " + " AND ".join(clauses)
-
+        base_query += " WHERE " + " AND ".join(clauses)
         base_query += " ORDER BY timestamp DESC"
 
         if limit:
@@ -362,43 +705,63 @@ def get_current_signals(limit: Optional[int] = None, executed: Optional[bool] = 
         for row in rows:
             results.append({
                 'id': int(row[0]),
-                'timestamp': row[1],
-                'market_id': row[2],
-                'market_question': row[3],
-                'action': row[4],
-                'target_price': float(row[5]) if row[5] is not None else None,
-                'amount': float(row[6]) if row[6] is not None else None,
-                'confidence': float(row[7]) if row[7] is not None else None,
-                'reason': row[8],
-                'yes_price': float(row[9]) if row[9] is not None else None,
-                'no_price': float(row[10]) if row[10] is not None else None,
-                'market_liquidity': float(row[11]) if row[11] is not None else None,
-                'market_volume': float(row[12]) if row[12] is not None else None,
-                'event_id': row[13],
-                'event_title': row[14],
-                'event_end_date': row[15],
-                'executed': bool(row[16]) if row[16] is not None else False,
-                'executed_at': row[17],
-                'trade_id': row[18]
+                'portfolio_id': row[1],
+                'strategy_type': row[2],
+                'timestamp': row[3],
+                'market_id': row[4],
+                'market_question': row[5],
+                'action': row[6],
+                'target_price': float(row[7]) if row[7] is not None else None,
+                'amount': float(row[8]) if row[8] is not None else None,
+                'confidence': float(row[9]) if row[9] is not None else None,
+                'reason': row[10],
+                'yes_price': float(row[11]) if row[11] is not None else None,
+                'no_price': float(row[12]) if row[12] is not None else None,
+                'market_liquidity': float(row[13]) if row[13] is not None else None,
+                'market_volume': float(row[14]) if row[14] is not None else None,
+                'event_id': row[15],
+                'event_title': row[16],
+                'event_end_date': row[17],
+                'executed': bool(row[18]) if row[18] is not None else False,
+                'executed_at': row[19],
+                'trade_id': row[20]
             })
         return results
 
 
-def mark_signal_executed(signal_id: int, trade_id: str, executed_at: Optional[datetime] = None):
-    """Mark a signal executed and link to a trade id."""
+def mark_signal_executed(signal_id: int, trade_id: str, executed_at: Optional[datetime] = None, portfolio_id: int = None):
+    """
+    Mark a signal executed and link to a trade id
+
+    Args:
+        signal_id: Signal ID to mark as executed
+        trade_id: Associated trade ID
+        executed_at: Execution timestamp (defaults to NOW())
+        portfolio_id: Portfolio ID (optional, for additional safety)
+    """
     with get_db() as db:
-        db.execute(text("""
+        where_clause = "id = :signal_id"
+        params = {
+            'signal_id': signal_id,
+            'trade_id': trade_id,
+            'executed_at': executed_at
+        }
+
+        if portfolio_id is not None:
+            where_clause += " AND portfolio_id = :portfolio_id"
+            params['portfolio_id'] = portfolio_id
+
+        query = f"""
             UPDATE trading_signals
             SET executed = TRUE,
                 executed_at = COALESCE(:executed_at, NOW()),
                 trade_id = :trade_id
-            WHERE id = :signal_id
-        """), {
-            'signal_id': signal_id,
-            'trade_id': trade_id,
-            'executed_at': executed_at
-        })
+            WHERE {where_clause}
+        """
+
+        db.execute(text(query), params)
         db.commit()
+        logger.debug(f"Marked signal {signal_id} as executed with trade {trade_id}")
 
 
 # ============================================================================
@@ -421,33 +784,27 @@ def upsert_events(events: List[Dict]):
 
             db.execute(text("""
                 INSERT INTO events
-                (event_id, title, slug, liquidity, volume, volume24hr,
-                 start_date, end_date, days_until_end, event_data, is_filtered, updated_at)
-                VALUES (:event_id, :title, :slug, :liquidity, :volume, :volume24hr,
-                        :start_date, :end_date, :days_until_end, CAST(:event_data AS jsonb), :is_filtered, NOW())
-                ON CONFLICT (event_id) DO UPDATE SET
+                (id, title, slug, liquidity, volume, volume24hr,
+                 end_date, is_filtered, last_updated)
+                VALUES (:id, :title, :slug, :liquidity, :volume, :volume24hr,
+                        :end_date, :is_filtered, NOW())
+                ON CONFLICT (id) DO UPDATE SET
                     title = EXCLUDED.title,
                     slug = EXCLUDED.slug,
                     liquidity = EXCLUDED.liquidity,
                     volume = EXCLUDED.volume,
                     volume24hr = EXCLUDED.volume24hr,
-                    start_date = EXCLUDED.start_date,
                     end_date = EXCLUDED.end_date,
-                    days_until_end = EXCLUDED.days_until_end,
-                    event_data = EXCLUDED.event_data,
                     is_filtered = EXCLUDED.is_filtered,
-                    updated_at = NOW()
+                    last_updated = NOW()
             """), {
-                'event_id': event.get('id'),
+                'id': event.get('id'),
                 'title': event.get('title'),
                 'slug': event.get('slug'),
                 'liquidity': event.get('liquidity', 0),
                 'volume': event.get('volume', 0),
                 'volume24hr': event.get('volume24hr', 0),
-                'start_date': event.get('startDate'),
                 'end_date': event.get('endDate'),
-                'days_until_end': event.get('days_until_end'),
-                'event_data': event_data_json,
                 'is_filtered': event.get('is_filtered', False)
             })
         db.commit()
@@ -457,8 +814,7 @@ def get_events(filters: Dict = None) -> List[Dict]:
     """Get events with optional filters"""
     with get_db() as db:
         query = """
-            SELECT event_id, title, slug, liquidity, volume, volume24hr,
-                   start_date, end_date, days_until_end, event_data, is_filtered
+            SELECT id, title, slug, liquidity, volume, volume24hr, end_date, is_filtered
             FROM events
         """
 
@@ -479,24 +835,17 @@ def get_events(filters: Dict = None) -> List[Dict]:
 
         events = []
         for row in results:
-            # PostgreSQL returns jsonb as dict already, no need to parse
-            event_data = row[9] if row[9] else {}
-            if isinstance(event_data, str):
-                event_data = json.loads(event_data)
-
-            event_data.update({
+            event = {
                 'id': row[0],
                 'title': row[1],
                 'slug': row[2],
                 'liquidity': float(row[3]) if row[3] else 0.0,
                 'volume': float(row[4]) if row[4] else 0.0,
                 'volume24hr': float(row[5]) if row[5] else 0.0,
-                'startDate': row[6],
-                'endDate': row[7],
-                'days_until_end': row[8],
-                'is_filtered': row[10]
-            })
-            events.append(event_data)
+                'endDate': row[6],
+                'is_filtered': row[7]
+            }
+            events.append(event)
 
         return events
 
@@ -516,39 +865,39 @@ def upsert_markets(markets: List[Dict]):
     """Insert or update markets in database"""
     with get_db() as db:
         for market in markets:
-            market_data_json = json.dumps(market, default=_json_default_serializer)
             db.execute(text("""
                 INSERT INTO markets
-                (market_id, question, event_id, event_title, event_end_date,
+                (id, question, event_id, event_title, end_date,
                  liquidity, volume, volume24hr, yes_price, no_price, market_conviction,
-                 market_data, is_filtered, updated_at)
-                VALUES (:market_id, :question, :event_id, :event_title, :event_end_date,
+                 is_filtered, last_updated)
+                VALUES (:id, :question, :event_id, :event_title, :end_date,
                         :liquidity, :volume, :volume24hr, :yes_price, :no_price,
-                        :market_conviction, CAST(:market_data AS jsonb), :is_filtered, NOW())
-                ON CONFLICT (market_id) DO UPDATE SET
+                        :market_conviction, :is_filtered, NOW())
+                ON CONFLICT (id) DO UPDATE SET
                     question = EXCLUDED.question,
+                    event_id = EXCLUDED.event_id,
+                    event_title = EXCLUDED.event_title,
+                    end_date = EXCLUDED.end_date,
                     liquidity = EXCLUDED.liquidity,
                     volume = EXCLUDED.volume,
                     volume24hr = EXCLUDED.volume24hr,
                     yes_price = EXCLUDED.yes_price,
                     no_price = EXCLUDED.no_price,
                     market_conviction = EXCLUDED.market_conviction,
-                    market_data = EXCLUDED.market_data,
                     is_filtered = EXCLUDED.is_filtered,
-                    updated_at = NOW()
+                    last_updated = NOW()
             """), {
-                'market_id': market.get('id'),
+                'id': market.get('id'),
                 'question': market.get('question'),
                 'event_id': market.get('event_id'),
                 'event_title': market.get('event_title'),
-                'event_end_date': market.get('event_end_date'),
+                'end_date': market.get('event_end_date') or market.get('endDate'),
                 'liquidity': market.get('liquidity', 0),
                 'volume': market.get('volume', 0),
                 'volume24hr': market.get('volume24hr', 0),
                 'yes_price': market.get('yes_price'),
                 'no_price': market.get('no_price'),
                 'market_conviction': market.get('market_conviction'),
-                'market_data': market_data_json,
                 'is_filtered': market.get('is_filtered', True)
             })
         db.commit()
@@ -558,9 +907,9 @@ def get_markets(filters: Dict = None) -> List[Dict]:
     """Get markets with optional filters"""
     with get_db() as db:
         query = """
-            SELECT market_id, question, event_id, event_title, event_end_date,
+            SELECT id, question, event_id, event_title, end_date,
                    liquidity, volume, volume24hr, yes_price, no_price,
-                   market_conviction, market_data, is_filtered
+                   market_conviction, is_filtered
             FROM markets
         """
 
@@ -581,26 +930,22 @@ def get_markets(filters: Dict = None) -> List[Dict]:
 
         markets = []
         for row in results:
-            # PostgreSQL returns jsonb as dict already, no need to parse
-            market_data = row[11] if row[11] else {}
-            if isinstance(market_data, str):
-                market_data = json.loads(market_data)
-
-            market_data.update({
+            market = {
                 'id': row[0],
                 'question': row[1],
                 'event_id': row[2],
                 'event_title': row[3],
                 'event_end_date': row[4],
+                'endDate': row[4],  # Also provide endDate for compatibility
                 'liquidity': float(row[5]) if row[5] else 0.0,
                 'volume': float(row[6]) if row[6] else 0.0,
                 'volume24hr': float(row[7]) if row[7] else 0.0,
                 'yes_price': float(row[8]) if row[8] else None,
                 'no_price': float(row[9]) if row[9] else None,
                 'market_conviction': float(row[10]) if row[10] else None,
-                'is_filtered': row[12]
-            })
-            markets.append(market_data)
+                'is_filtered': row[11]
+            }
+            markets.append(market)
 
         return markets
 
@@ -635,35 +980,55 @@ def clear_filtered_markets():
 # HISTORY OPERATIONS (Phase 2)
 # ============================================================================
 
-def insert_portfolio_history_snapshot(snapshot: Dict) -> int:
-    """Insert a single portfolio history snapshot and return its id."""
+def insert_portfolio_history_snapshot(snapshot: Dict, portfolio_id: int = None) -> int:
+    """
+    Insert a single portfolio history snapshot and return its id
+
+    Args:
+        snapshot: Snapshot data dictionary
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+    """
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
+
+    snapshot['portfolio_id'] = portfolio_id
+
     with get_db() as db:
         result = db.execute(text("""
             INSERT INTO portfolio_history
-            (snapshot_date, timestamp, balance, total_invested, total_profit_loss,
+            (portfolio_id, snapshot_date, timestamp, balance, total_invested, total_profit_loss,
              total_value, open_positions, trade_count)
-            VALUES (:snapshot_date, :timestamp, :balance, :total_invested, :total_profit_loss,
+            VALUES (:portfolio_id, :snapshot_date, :timestamp, :balance, :total_invested, :total_profit_loss,
                     :total_value, :open_positions, :trade_count)
             RETURNING id
         """), snapshot)
         inserted_id = result.scalar_one()
         db.commit()
+        logger.debug(f"Created portfolio history snapshot for portfolio {portfolio_id}")
         return int(inserted_id)
 
 
-def get_portfolio_history(limit: Optional[int] = None) -> List[Dict]:
-    """Return recent portfolio history rows ordered by date/time descending."""
+def get_portfolio_history(portfolio_id: int = None, limit: Optional[int] = None) -> List[Dict]:
+    """
+    Return recent portfolio history rows ordered by date/time descending
+
+    Args:
+        portfolio_id: Portfolio ID (defaults to first active portfolio)
+        limit: Maximum number of snapshots to return
+    """
+    if portfolio_id is None:
+        portfolio_id = _get_default_portfolio_id()
+
     with get_db() as db:
-        query = (
-            """
-            SELECT id, snapshot_date, timestamp, balance, total_invested,
+        query = """
+            SELECT id, portfolio_id, snapshot_date, timestamp, balance, total_invested,
                    total_profit_loss, total_value, open_positions, trade_count
             FROM portfolio_history
+            WHERE portfolio_id = :portfolio_id
             ORDER BY snapshot_date DESC, timestamp DESC
-            """
-        )
+        """
 
-        params: Dict = {}
+        params: Dict = {'portfolio_id': portfolio_id}
         if limit:
             query += " LIMIT :limit"
             params["limit"] = limit
@@ -673,14 +1038,15 @@ def get_portfolio_history(limit: Optional[int] = None) -> List[Dict]:
         for row in rows:
             results.append({
                 'id': int(row[0]),
-                'snapshot_date': row[1],
-                'timestamp': row[2],
-                'balance': float(row[3]) if row[3] is not None else None,
-                'total_invested': float(row[4]) if row[4] is not None else None,
-                'total_profit_loss': float(row[5]) if row[5] is not None else None,
-                'total_value': float(row[6]) if row[6] is not None else None,
-                'open_positions': int(row[7]) if row[7] is not None else 0,
-                'trade_count': int(row[8]) if row[8] is not None else 0,
+                'portfolio_id': row[1],
+                'snapshot_date': row[2],
+                'timestamp': row[3],
+                'balance': float(row[4]) if row[4] is not None else None,
+                'total_invested': float(row[5]) if row[5] is not None else None,
+                'total_profit_loss': float(row[6]) if row[6] is not None else None,
+                'total_value': float(row[7]) if row[7] is not None else None,
+                'open_positions': int(row[8]) if row[8] is not None else 0,
+                'trade_count': int(row[9]) if row[9] is not None else 0,
             })
         return results
 

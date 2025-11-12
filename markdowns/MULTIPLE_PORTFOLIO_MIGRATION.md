@@ -1773,7 +1773,7 @@ This guide walks you through implementing the portfolio-centric architecture fro
 
 ---
 
-### Phase 1: Database Schema (Days 1-2)
+### Phase 1: Database Schema (Completed Successfully!!!!!)
 
 #### Step 1: Save Current State
 
@@ -1904,13 +1904,13 @@ python test_portfolio_migration.py
 
 Update `src/controllers/paper_trading_controller.py`:
 
-**6.1 Add Portfolio Management Endpoints**
+**6.1 Add Portfolio Management Endpoints** (DONE)
 - `POST /portfolios/create` - Create portfolio
 - `GET /paper-trading/portfolio?portfolio_id=X` - Get portfolio
 - `GET /paper-trading/portfolio` - Get all portfolios
 - `PATCH /portfolios/{portfolio_id}` - Update portfolio
 
-**6.2 Update Existing Endpoints**
+**6.2 Update Existing Endpoints** (WHAT DOES THIS ACUTALLY INVOLVE? I THINK WE DID THIS????)
 - Add `portfolio_id` parameter to all position/trade queries
 - Use `_get_default_portfolio_id()` for backward compatibility
 - Filter all queries by portfolio_id
@@ -1945,7 +1945,7 @@ def update_all_portfolio_prices():
 
 See [Price Updater Modifications](#price-updater-modifications) section for details.
 
-#### Step 8: Update Trading Controller
+#### Step 8: Update Trading Controller (change the name of this to portfolio orchestrator as well)
 
 Update `src/controllers/trading_controller.py` for portfolio orchestration:
 

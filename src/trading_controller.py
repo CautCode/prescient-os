@@ -58,9 +58,13 @@ def ensure_data_directories():
     """
     os.makedirs("data/history", exist_ok=True)
 
-def create_daily_portfolio_snapshot(portfolio_data: Dict):
+def create_daily_portfolio_snapshot(portfolio_data: Dict, portfolio_id: Optional[int] = None):
     """
     Create daily portfolio snapshot (DB-only, Phase 2).
+
+    Args:
+        portfolio_data: Portfolio data dictionary
+        portfolio_id: Portfolio ID (optional, defaults to first active portfolio)
     """
     try:
         now = datetime.now()
@@ -75,9 +79,9 @@ def create_daily_portfolio_snapshot(portfolio_data: Dict):
             'open_positions': open_positions,
             'trade_count': portfolio_data.get('trade_count', 0),
         }
-        snapshot_id = insert_portfolio_history_snapshot(snapshot)
+        snapshot_id = insert_portfolio_history_snapshot(snapshot, portfolio_id=portfolio_id)
         logger.info(
-            f"Inserted portfolio snapshot id={snapshot_id} total_value={snapshot['total_value']:.2f}"
+            f"Inserted portfolio snapshot id={snapshot_id} total_value={snapshot['total_value']:.2f} portfolio_id={portfolio_id}"
         )
     except Exception as e:
         logger.error(f"Error creating portfolio snapshot (DB): {e}")
@@ -109,6 +113,439 @@ def archive_current_signals():
 async def root():
     """Health check endpoint"""
     return {"message": "Polymarket Trading Controller API is running", "timestamp": datetime.now().isoformat()}
+
+@app.get("/trading/run-portfolio-cycle")
+async def run_portfolio_trading_cycle(
+    portfolio_id: int,
+    # Event filtering parameters
+    event_min_liquidity: float = 10000,
+    event_min_volume: float = 50000,
+    event_min_volume_24hr: Optional[float] = None,
+    event_max_days_until_end: Optional[int] = None,
+    event_min_days_until_end: Optional[int] = None,
+
+    # Market filtering parameters
+    min_liquidity: float = 10000,
+    min_volume: float = 50000,
+    min_volume_24hr: Optional[float] = None,
+    min_market_conviction: Optional[float] = 0.5,
+    max_market_conviction: Optional[float] = 0.6
+):
+    """
+    Run complete trading cycle for a specific portfolio
+
+    Args:
+        portfolio_id: Portfolio ID to run cycle for
+        ... (same filtering parameters as full cycle)
+
+    Returns:
+        Trading cycle results for the specified portfolio
+    """
+    from src.db.operations import get_portfolio_state
+
+    try:
+        logger.info(f"=== STARTING PORTFOLIO TRADING CYCLE FOR PORTFOLIO {portfolio_id} ===")
+
+        # Verify portfolio exists
+        try:
+            portfolio = get_portfolio_state(portfolio_id)
+            logger.info(f"Running cycle for portfolio: {portfolio['name']} (ID: {portfolio_id})")
+        except ValueError as ve:
+            raise HTTPException(status_code=404, detail=str(ve))
+
+        # Ensure directories exist
+        ensure_data_directories()
+
+        results = {
+            "portfolio_id": portfolio_id,
+            "portfolio_name": portfolio['name'],
+            "cycle_started": datetime.now().isoformat(),
+            "steps": [],
+            "success": True,
+            "error_details": None
+        }
+
+        # Step 1: Fetch and filter markets (shared data)
+        logger.info("Step 1: Fetching and filtering markets...")
+        export_events_url = f"{EVENTS_API_BASE}/events/export-all-active-events-db"
+        export_response = call_api(export_events_url)
+
+        if export_response:
+            results["steps"].append({
+                "step": "1a",
+                "name": "Export Events",
+                "status": "completed",
+                "message": f"Exported {export_response.get('total_events', 0)} events"
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Event export failed")
+
+        # Filter events
+        filter_events_url = f"{EVENTS_API_BASE}/events/filter-trading-candidates-db"
+        event_params = {
+            "min_liquidity": event_min_liquidity,
+            "min_volume": event_min_volume,
+            "min_volume_24hr": event_min_volume_24hr,
+            "max_days_until_end": event_max_days_until_end,
+            "min_days_until_end": event_min_days_until_end
+        }
+        event_param_string = "&".join([f"{k}={v}" for k, v in event_params.items() if v is not None])
+        filter_response = call_api(f"{filter_events_url}?{event_param_string}")
+
+        if filter_response:
+            results["steps"].append({
+                "step": "1b",
+                "name": "Filter Events",
+                "status": "completed",
+                "message": f"Filtered {filter_response.get('total_candidates', 0)} candidates"
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Event filtering failed")
+
+        # Filter markets
+        markets_url = f"{MARKETS_API_BASE}/markets/export-filtered-markets-db"
+        market_params = {
+            "min_liquidity": min_liquidity,
+            "min_volume": min_volume,
+            "min_volume_24hr": min_volume_24hr,
+            "min_market_conviction": min_market_conviction,
+            "max_market_conviction": max_market_conviction
+        }
+        market_param_string = "&".join([f"{k}={v}" for k, v in market_params.items() if v is not None])
+        markets_response = call_api(f"{markets_url}?{market_param_string}")
+
+        if markets_response:
+            results["steps"].append({
+                "step": "1c",
+                "name": "Filter Markets",
+                "status": "completed",
+                "message": f"Filtered {markets_response.get('filtered_markets', 0)} markets"
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Market filtering failed")
+
+        # Step 2: Generate signals for this portfolio
+        logger.info(f"Step 2: Generating signals for portfolio {portfolio_id}...")
+        signals_url = f"{STRATEGY_API_BASE}/strategy/generate-signals?portfolio_id={portfolio_id}"
+        signals_response = call_api(signals_url)
+
+        if signals_response:
+            results["steps"].append({
+                "step": "2",
+                "name": "Generate Signals",
+                "status": "completed",
+                "message": f"Generated {signals_response.get('total_signals_generated', 0)} signals",
+                "details": signals_response
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Signal generation failed")
+
+        # Step 3: Execute trades for this portfolio
+        logger.info(f"Step 3: Executing trades for portfolio {portfolio_id}...")
+        execute_url = f"{PAPER_TRADING_API_BASE}/paper-trading/execute-signals?portfolio_id={portfolio_id}"
+        execute_response = call_api(execute_url)
+
+        if execute_response:
+            results["steps"].append({
+                "step": "3",
+                "name": "Execute Trades",
+                "status": "completed",
+                "message": f"Executed {execute_response.get('execution_summary', {}).get('executed_trades', 0)} trades",
+                "details": execute_response
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Trade execution failed")
+
+        # Step 4: Update prices for this portfolio
+        logger.info(f"Step 4: Updating prices for portfolio {portfolio_id}...")
+        price_update_url = f"{PAPER_TRADING_API_BASE}/price-updater/update?portfolio_id={portfolio_id}"
+        price_response = call_api(price_update_url)
+
+        if price_response:
+            results["steps"].append({
+                "step": "4",
+                "name": "Update Prices",
+                "status": "completed",
+                "message": f"Updated P&L for portfolio {portfolio_id}",
+                "details": price_response
+            })
+        else:
+            logger.warning(f"Price update failed for portfolio {portfolio_id}")
+            results["steps"].append({
+                "step": "4",
+                "name": "Update Prices",
+                "status": "failed",
+                "message": "Price update failed"
+            })
+
+        # Step 5: Create portfolio snapshot
+        logger.info(f"Step 5: Creating snapshot for portfolio {portfolio_id}...")
+        portfolio_url = f"{PAPER_TRADING_API_BASE}/portfolios/{portfolio_id}"
+        portfolio_response = call_api(portfolio_url)
+
+        if portfolio_response:
+            portfolio_data = portfolio_response.get('portfolio', {})
+            # Convert to format expected by create_daily_portfolio_snapshot
+            snapshot_data = {
+                'balance': portfolio_data.get('current_balance', 0),
+                'positions': portfolio_data.get('positions', []),
+                'total_invested': portfolio_data.get('total_invested', 0),
+                'total_profit_loss': portfolio_data.get('total_profit_loss', 0),
+                'trade_count': portfolio_data.get('trade_count', 0)
+            }
+            create_daily_portfolio_snapshot(snapshot_data, portfolio_id=portfolio_id)
+            results["steps"].append({
+                "step": "5",
+                "name": "Portfolio Snapshot",
+                "status": "completed",
+                "message": "Created portfolio snapshot"
+            })
+        else:
+            results["steps"].append({
+                "step": "5",
+                "name": "Portfolio Snapshot",
+                "status": "failed",
+                "message": "Failed to create snapshot"
+            })
+
+        results["cycle_completed"] = datetime.now().isoformat()
+
+        logger.info(f"=== PORTFOLIO {portfolio_id} TRADING CYCLE COMPLETED ===")
+
+        return {
+            "message": f"Portfolio trading cycle completed for {portfolio['name']}",
+            "results": results,
+            "summary": {
+                "total_steps": len(results["steps"]),
+                "successful_steps": len([s for s in results["steps"] if s["status"] == "completed"]),
+                "failed_steps": len([s for s in results["steps"] if s["status"] == "failed"]),
+                "overall_success": results["success"]
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in portfolio {portfolio_id} trading cycle: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Portfolio trading cycle error: {str(e)}")
+
+
+@app.get("/trading/run-all-portfolios")
+async def run_all_portfolios_cycle(
+    # Event filtering parameters
+    event_min_liquidity: float = 10000,
+    event_min_volume: float = 50000,
+    event_min_volume_24hr: Optional[float] = None,
+    event_max_days_until_end: Optional[int] = None,
+    event_min_days_until_end: Optional[int] = None,
+
+    # Market filtering parameters
+    min_liquidity: float = 10000,
+    min_volume: float = 50000,
+    min_volume_24hr: Optional[float] = None,
+    min_market_conviction: Optional[float] = 0.5,
+    max_market_conviction: Optional[float] = 0.6
+):
+    """
+    Run trading cycle for all active portfolios
+
+    Returns:
+        Results for all portfolio cycles
+    """
+    from src.db.operations import get_all_portfolios
+
+    try:
+        logger.info("=== STARTING TRADING CYCLE FOR ALL ACTIVE PORTFOLIOS ===")
+
+        # Get all active portfolios
+        portfolios = get_all_portfolios(status='active')
+
+        if not portfolios:
+            raise HTTPException(status_code=404, detail="No active portfolios found")
+
+        logger.info(f"Running cycle for {len(portfolios)} active portfolios")
+
+        # Ensure directories exist
+        ensure_data_directories()
+
+        all_results = {
+            "cycle_started": datetime.now().isoformat(),
+            "total_portfolios": len(portfolios),
+            "portfolio_results": [],
+            "shared_steps": [],
+            "overall_success": True
+        }
+
+        # Step 1: Fetch and filter markets ONCE (shared across all portfolios)
+        logger.info("Step 1: Fetching and filtering markets (shared)...")
+        export_events_url = f"{EVENTS_API_BASE}/events/export-all-active-events-db"
+        export_response = call_api(export_events_url)
+
+        if export_response:
+            all_results["shared_steps"].append({
+                "step": "1a",
+                "name": "Export Events",
+                "status": "completed",
+                "message": f"Exported {export_response.get('total_events', 0)} events"
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Event export failed")
+
+        # Filter events
+        filter_events_url = f"{EVENTS_API_BASE}/events/filter-trading-candidates-db"
+        event_params = {
+            "min_liquidity": event_min_liquidity,
+            "min_volume": event_min_volume,
+            "min_volume_24hr": event_min_volume_24hr,
+            "max_days_until_end": event_max_days_until_end,
+            "min_days_until_end": event_min_days_until_end
+        }
+        event_param_string = "&".join([f"{k}={v}" for k, v in event_params.items() if v is not None])
+        filter_response = call_api(f"{filter_events_url}?{event_param_string}")
+
+        if filter_response:
+            all_results["shared_steps"].append({
+                "step": "1b",
+                "name": "Filter Events",
+                "status": "completed",
+                "message": f"Filtered {filter_response.get('total_candidates', 0)} candidates"
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Event filtering failed")
+
+        # Filter markets
+        markets_url = f"{MARKETS_API_BASE}/markets/export-filtered-markets-db"
+        market_params = {
+            "min_liquidity": min_liquidity,
+            "min_volume": min_volume,
+            "min_volume_24hr": min_volume_24hr,
+            "min_market_conviction": min_market_conviction,
+            "max_market_conviction": max_market_conviction
+        }
+        market_param_string = "&".join([f"{k}={v}" for k, v in market_params.items() if v is not None])
+        markets_response = call_api(f"{markets_url}?{market_param_string}")
+
+        if markets_response:
+            all_results["shared_steps"].append({
+                "step": "1c",
+                "name": "Filter Markets",
+                "status": "completed",
+                "message": f"Filtered {markets_response.get('filtered_markets', 0)} markets"
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Market filtering failed")
+
+        # Step 2: Run cycle for each portfolio
+        for portfolio in portfolios:
+            pid = portfolio['portfolio_id']
+            pname = portfolio['name']
+
+            logger.info(f"Running cycle for portfolio {pid}: {pname}")
+
+            portfolio_result = {
+                "portfolio_id": pid,
+                "portfolio_name": pname,
+                "steps": [],
+                "success": True
+            }
+
+            try:
+                # Generate signals for this portfolio
+                signals_url = f"{STRATEGY_API_BASE}/strategy/generate-signals?portfolio_id={pid}"
+                signals_response = call_api(signals_url)
+
+                if signals_response:
+                    portfolio_result["steps"].append({
+                        "step": "2",
+                        "name": "Generate Signals",
+                        "status": "completed",
+                        "signals_generated": signals_response.get('total_signals_generated', 0)
+                    })
+                else:
+                    portfolio_result["steps"].append({
+                        "step": "2",
+                        "name": "Generate Signals",
+                        "status": "failed"
+                    })
+                    portfolio_result["success"] = False
+
+                # Execute trades for this portfolio
+                execute_url = f"{PAPER_TRADING_API_BASE}/paper-trading/execute-signals?portfolio_id={pid}"
+                execute_response = call_api(execute_url)
+
+                if execute_response:
+                    portfolio_result["steps"].append({
+                        "step": "3",
+                        "name": "Execute Trades",
+                        "status": "completed",
+                        "trades_executed": execute_response.get('execution_summary', {}).get('executed_trades', 0)
+                    })
+                else:
+                    portfolio_result["steps"].append({
+                        "step": "3",
+                        "name": "Execute Trades",
+                        "status": "failed"
+                    })
+                    portfolio_result["success"] = False
+
+                # Update prices for this portfolio
+                price_update_url = f"{PAPER_TRADING_API_BASE}/price-updater/update?portfolio_id={pid}"
+                price_response = call_api(price_update_url)
+
+                if price_response:
+                    portfolio_result["steps"].append({
+                        "step": "4",
+                        "name": "Update Prices",
+                        "status": "completed"
+                    })
+                else:
+                    portfolio_result["steps"].append({
+                        "step": "4",
+                        "name": "Update Prices",
+                        "status": "failed"
+                    })
+
+                logger.info(f"✓ Completed cycle for portfolio {pid}: {pname}")
+
+            except Exception as portfolio_error:
+                logger.error(f"Error in portfolio {pid} cycle: {portfolio_error}")
+                portfolio_result["success"] = False
+                portfolio_result["error"] = str(portfolio_error)
+                all_results["overall_success"] = False
+
+            all_results["portfolio_results"].append(portfolio_result)
+
+        all_results["cycle_completed"] = datetime.now().isoformat()
+
+        # Calculate summary
+        successful_portfolios = len([p for p in all_results["portfolio_results"] if p["success"]])
+        failed_portfolios = len([p for p in all_results["portfolio_results"] if not p["success"]])
+
+        logger.info(f"=== ALL PORTFOLIOS CYCLE COMPLETED: {successful_portfolios}/{len(portfolios)} successful ===")
+
+        return {
+            "message": f"Trading cycle completed for {len(portfolios)} portfolios",
+            "results": all_results,
+            "summary": {
+                "total_portfolios": len(portfolios),
+                "successful_portfolios": successful_portfolios,
+                "failed_portfolios": failed_portfolios,
+                "overall_success": all_results["overall_success"]
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in all-portfolios cycle: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"All-portfolios cycle error: {str(e)}")
+
 
 @app.get("/trading/run-full-cycle")
 async def run_full_trading_cycle(
